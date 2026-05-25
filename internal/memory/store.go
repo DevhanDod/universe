@@ -42,9 +42,10 @@ func (s *Store) InsertObservation(obs Observation) (*Observation, error) {
 		return nil, fmt.Errorf("marshal tool_calls: %w", err)
 	}
 
-	var vec pgvector.Vector
+	var vecParam interface{}
 	if len(obs.Embedding) > 0 {
-		vec = pgvector.NewVector(obs.Embedding)
+		v := pgvector.NewVector(obs.Embedding)
+		vecParam = v
 	}
 
 	row := s.pool.QueryRow(context.Background(), `
@@ -54,7 +55,7 @@ func (s *Store) InsertObservation(obs Observation) (*Observation, error) {
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id, created_at`,
 		obs.DeveloperID, obs.RepoID, obs.GraphNodeID, obs.Category,
-		obs.Summary, obs.Detail, vec, obs.SessionID,
+		obs.Summary, obs.Detail, vecParam, obs.SessionID,
 		toolCallsJSON, obs.Confidence, obs.Shared,
 	)
 
@@ -76,9 +77,10 @@ func (s *Store) InsertBatch(observations []Observation) ([]Observation, error) {
 		if err != nil {
 			return nil, fmt.Errorf("marshal tool_calls: %w", err)
 		}
-		var vec pgvector.Vector
+		var vecParam interface{}
 		if len(obs.Embedding) > 0 {
-			vec = pgvector.NewVector(obs.Embedding)
+			v := pgvector.NewVector(obs.Embedding)
+			vecParam = v
 		}
 		batch.Queue(`
 			INSERT INTO observations
@@ -87,7 +89,7 @@ func (s *Store) InsertBatch(observations []Observation) ([]Observation, error) {
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			RETURNING id, created_at`,
 			obs.DeveloperID, obs.RepoID, obs.GraphNodeID, obs.Category,
-			obs.Summary, obs.Detail, vec, obs.SessionID,
+			obs.Summary, obs.Detail, vecParam, obs.SessionID,
 			toolCallsJSON, obs.Confidence, obs.Shared,
 		)
 	}
@@ -311,7 +313,7 @@ func (s *Store) GetStats() (*MemoryStats, error) {
 
 func (s *Store) scanObservation(row pgx.Row) (*Observation, error) {
 	var obs Observation
-	var vec pgvector.Vector
+	var vec *pgvector.Vector
 	var toolCallsJSON []byte
 	if err := row.Scan(
 		&obs.ID, &obs.DeveloperID, &obs.RepoID, &obs.GraphNodeID,
@@ -321,7 +323,9 @@ func (s *Store) scanObservation(row pgx.Row) (*Observation, error) {
 	); err != nil {
 		return nil, fmt.Errorf("scan observation: %w", err)
 	}
-	obs.Embedding = vec.Slice()
+	if vec != nil {
+		obs.Embedding = vec.Slice()
+	}
 	if len(toolCallsJSON) > 0 {
 		_ = json.Unmarshal(toolCallsJSON, &obs.ToolCalls)
 	}
@@ -332,7 +336,7 @@ func (s *Store) scanObservations(rows pgx.Rows) ([]Observation, error) {
 	var out []Observation
 	for rows.Next() {
 		var obs Observation
-		var vec pgvector.Vector
+		var vec *pgvector.Vector
 		var toolCallsJSON []byte
 		if err := rows.Scan(
 			&obs.ID, &obs.DeveloperID, &obs.RepoID, &obs.GraphNodeID,
@@ -342,7 +346,9 @@ func (s *Store) scanObservations(rows pgx.Rows) ([]Observation, error) {
 		); err != nil {
 			return nil, fmt.Errorf("scan observation row: %w", err)
 		}
-		obs.Embedding = vec.Slice()
+		if vec != nil {
+			obs.Embedding = vec.Slice()
+		}
 		if len(toolCallsJSON) > 0 {
 			_ = json.Unmarshal(toolCallsJSON, &obs.ToolCalls)
 		}

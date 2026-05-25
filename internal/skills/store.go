@@ -42,9 +42,10 @@ func (s *Store) InsertSkill(skill Skill) (*Skill, error) {
 	negTagsJSON, _ := json.Marshal(skill.NegativeTags)
 	complexJSON, _ := json.Marshal(skill.SuccessByComplexity)
 
-	var vec pgvector.Vector
+	var vecParam interface{}
 	if len(skill.Embedding) > 0 {
-		vec = pgvector.NewVector(skill.Embedding)
+		v := pgvector.NewVector(skill.Embedding)
+		vecParam = v
 	}
 
 	row := s.pool.QueryRow(context.Background(), `
@@ -57,7 +58,7 @@ func (s *Store) InsertSkill(skill Skill) (*Skill, error) {
 		skill.Name, skill.Version, skill.ParentID, string(skill.Evolution),
 		skill.GraphNodeIDs, nullStr(skill.Language),
 		skill.TriggerDesc, skill.Instruction,
-		testCaseJSON, negTagsJSON, vec,
+		testCaseJSON, negTagsJSON, vecParam,
 		skill.CreatedBy, skill.Shared, skill.IsActive,
 		skill.Confidence, complexJSON,
 	)
@@ -416,7 +417,7 @@ func (s *Store) PruneUnusedSkills(afterDays int) (int, error) {
 		DELETE FROM skills
 		WHERE is_active = true
 		  AND times_applied = 0
-		  AND created_at < NOW() - ($1 || ' days')::interval`, afterDays)
+		  AND created_at < NOW() - make_interval(days => $1)`, afterDays)
 	if err != nil {
 		return 0, err
 	}
@@ -489,7 +490,7 @@ const skillSelectSQL = `SELECT ` + skillColumns + ` FROM skills `
 
 func (s *Store) scanSkill(row pgx.Row) (*Skill, error) {
 	var sk Skill
-	var vec pgvector.Vector
+	var vec *pgvector.Vector
 	var testCaseJSON, negTagsJSON, complexJSON []byte
 	var language *string
 	if err := row.Scan(
@@ -505,7 +506,9 @@ func (s *Store) scanSkill(row pgx.Row) (*Skill, error) {
 	if language != nil {
 		sk.Language = *language
 	}
-	sk.Embedding = vec.Slice()
+	if vec != nil {
+		sk.Embedding = vec.Slice()
+	}
 	if len(testCaseJSON) > 0 && string(testCaseJSON) != "null" {
 		json.Unmarshal(testCaseJSON, &sk.TestCase)
 	}
@@ -522,7 +525,7 @@ func (s *Store) scanSkills(rows pgx.Rows) ([]Skill, error) {
 	var out []Skill
 	for rows.Next() {
 		var sk Skill
-		var vec pgvector.Vector
+		var vec *pgvector.Vector
 		var testCaseJSON, negTagsJSON, complexJSON []byte
 		var language *string
 		if err := rows.Scan(
@@ -538,7 +541,9 @@ func (s *Store) scanSkills(rows pgx.Rows) ([]Skill, error) {
 		if language != nil {
 			sk.Language = *language
 		}
-		sk.Embedding = vec.Slice()
+		if vec != nil {
+			sk.Embedding = vec.Slice()
+		}
 		if len(testCaseJSON) > 0 && string(testCaseJSON) != "null" {
 			json.Unmarshal(testCaseJSON, &sk.TestCase)
 		}

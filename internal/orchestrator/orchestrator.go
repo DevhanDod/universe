@@ -232,6 +232,11 @@ func (o *Orchestrator) executeSingle(task Task, decision *RoutingDecision, model
 	}, nil
 }
 
+// Tracker returns the cost tracker for external inspection.
+func (o *Orchestrator) Tracker() *Tracker {
+	return o.tracker
+}
+
 // Stop gracefully shuts down the orchestrator.
 func (o *Orchestrator) Stop() {
 	if o.tracker != nil {

@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"context"
 	"os"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func testStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() {
 		// Clean up all test observations after each test
-		s.pool.Exec(nil, `DELETE FROM observations WHERE developer_id LIKE 'test-%'`) //nolint
+		s.pool.Exec(context.Background(), `DELETE FROM observations WHERE developer_id LIKE 'test-%'`) //nolint
 		s.Close()
 	})
 	return s
@@ -475,7 +476,7 @@ func TestDecay_ReducesConfidence(t *testing.T) {
 	}
 
 	// Manually set recalled_at to 30 days ago for this test
-	_, err = s.pool.Exec(nil,
+	_, err = s.pool.Exec(context.Background(),
 		`UPDATE observations SET recalled_at = NOW() - interval '30 days' WHERE id = $1`,
 		stored.ID)
 	if err != nil {

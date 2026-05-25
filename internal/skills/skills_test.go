@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"context"
 	"os"
 	"strings"
 	"testing"
@@ -20,8 +21,8 @@ func testStore(t *testing.T) *Store {
 		t.Fatalf("NewStore: %v", err)
 	}
 	t.Cleanup(func() {
-		s.pool.Exec(nil, `DELETE FROM skill_executions WHERE developer_id LIKE 'test-%'`)
-		s.pool.Exec(nil, `DELETE FROM skills WHERE created_by LIKE 'test-%' OR created_by = 'system-test'`)
+		s.pool.Exec(context.Background(), `DELETE FROM skill_executions WHERE developer_id LIKE 'test-%'`)
+		s.pool.Exec(context.Background(), `DELETE FROM skills WHERE created_by LIKE 'test-%' OR created_by = 'system-test'`)
 		s.Close()
 	})
 	return s
@@ -222,7 +223,7 @@ func TestStore_PruneUnused(t *testing.T) {
 	}
 
 	// Backdate the created_at to 60 days ago
-	s.pool.Exec(nil, `UPDATE skills SET created_at = NOW() - interval '60 days' WHERE id = $1`, stored.ID)
+	s.pool.Exec(context.Background(), `UPDATE skills SET created_at = NOW() - interval '60 days' WHERE id = $1`, stored.ID)
 
 	pruned, err := s.PruneUnusedSkills(30)
 	if err != nil {
@@ -533,7 +534,7 @@ func TestEvolver_FixFreezesOnLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Sync the attempts into DB
-	s.pool.Exec(nil, `UPDATE skills SET evolution_attempts_today = 1 WHERE id = $1`, stored.ID)
+	s.pool.Exec(context.Background(), `UPDATE skills SET evolution_attempts_today = 1 WHERE id = $1`, stored.ID)
 
 	ev := NewEvolver(s, nil, llm, safety, cfg)
 	stored.EvolutionAttemptsToday = 1 // reflect DB state
