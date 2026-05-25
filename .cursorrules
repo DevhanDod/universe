@@ -1,0 +1,35 @@
+# Universe MCP integration for Cursor
+#
+# Universe provides three advisory tools:
+#   universe_route_task    — routing decision (which model role for each phase)
+#   universe_recall_memory — past observations for the affected code nodes
+#   universe_get_skill     — matching skill/recipe for this class of task
+#
+# How to use the routing output:
+#   "premium"   → use your most capable model (configured in ~/.universe/config.yaml)
+#   "low_cost"  → use your faster/cheaper model
+#   "automated" → no LLM needed (e.g. run tests, linter)
+#
+# Workflow for every task:
+# 1. Call universe_route_task with the task description and affected graph node IDs.
+# 2. Call universe_recall_memory to surface relevant past observations.
+# 3. If a skill is suggested (skip_planning=true), call universe_get_skill and
+#    follow the instruction returned in the skill's "instruction" field.
+# 4. Otherwise follow planner_role → executor_role → verifier_role assignment.
+
+# Available MCP tools (automatically registered via .cursor/mcp.json):
+#
+# universe_route_task
+#   Input:  task (string), graph_node_ids ([]string), developer_id, language, repo_id
+#   Output: mode, planner_role, executor_role, verifier_role, next_step,
+#           skip_planning, template_id, matched_skill_id, memory_hit,
+#           reason, task_type, premium_model, low_cost_model
+#
+# universe_recall_memory
+#   Input:  graph_node_ids ([]string), developer_id, task_text
+#   Output: JSON array of ranked observation summaries (empty array if no DB)
+#
+# universe_get_skill
+#   Input:  task_text (string), graph_node_ids ([]string), language, developer_id
+#   Output: { found, skill_id, name, instruction, trigger_desc,
+#             success_rate, graph_overlap, times_applied }

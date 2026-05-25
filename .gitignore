@@ -1,0 +1,46 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+universe
+
+# Build output
+/bin/
+/dist/
+
+# Go test cache
+*.test
+*.out
+coverage.html
+
+# Go module download cache
+vendor/
+
+# Node / React build
+node_modules/
+dashboard/node_modules/
+internal/dashboard/static/assets/
+# Keep static/index.html (placeholder) but ignore built JS/CSS bundles
+internal/dashboard/static/*.js
+internal/dashboard/static/*.css
+
+# Environment files (contain secrets)
+.env
+*.env
+
+# IDE / OS
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
+
+# Universe graph cache (per-repo, not project code)
+.universe/
+
+# Claude Code local settings
+.claude/
+
+# Editor temp files (Claude Code edit artifacts)
+*.go.*[0-9]

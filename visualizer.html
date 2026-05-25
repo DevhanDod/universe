@@ -1,0 +1,1405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Universe — Knowledge Graph Visualizer</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+  <style>
+    :root {
+      --bg-primary:    #08080d;
+      --bg-secondary:  #0d0d16;
+      --bg-panel:      #111118;
+      --border:        #1a1a24;
+      --text-primary:  #e0e0e0;
+      --text-secondary:#888888;
+      --text-dim:      #555555;
+      --accent:        #6366F1;
+      --accent-hover:  #818CF8;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+    }
+
+    #app {
+      display: grid;
+      grid-template-rows: 50px 1fr 44px;
+      grid-template-columns: 220px 1fr 0px;
+      height: 100vh;
+      width: 100vw;
+    }
+    #app.detail-open { grid-template-columns: 220px 1fr 320px; }
+    #app.sidebar-hidden { grid-template-columns: 0px 1fr 0px; }
+    #app.sidebar-hidden.detail-open { grid-template-columns: 0px 1fr 320px; }
+
+    /* Toolbar */
+    #toolbar {
+      grid-column: 1 / -1;
+      grid-row: 1;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 0 16px;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border);
+      z-index: 20;
+    }
+    #toolbar .logo {
+      font-weight: 700;
+      font-size: 15px;
+      color: var(--accent);
+      white-space: nowrap;
+      user-select: none;
+    }
+    #search-box {
+      flex: 1;
+      max-width: 360px;
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      color: var(--text-primary);
+      font-size: 13px;
+      outline: none;
+    }
+    #search-box:focus { border-color: var(--accent); }
+    #search-box::placeholder { color: var(--text-dim); }
+    .toolbar-stats {
+      font-size: 12px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+    .toolbar-btn {
+      padding: 5px 12px;
+      border-radius: 5px;
+      border: 1px solid var(--border);
+      background: var(--bg-panel);
+      color: var(--text-secondary);
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+      user-select: none;
+    }
+    .toolbar-btn:hover { background: var(--border); color: var(--text-primary); }
+
+    /* Sidebar */
+    #sidebar {
+      grid-column: 1;
+      grid-row: 2;
+      background: var(--bg-secondary);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 8px 0;
+      font-size: 12px;
+      z-index: 10;
+      transition: width 0.15s;
+    }
+    .sidebar-hidden #sidebar { display: none; }
+    #sidebar::-webkit-scrollbar { width: 4px; }
+    #sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .tree-dir {
+      cursor: pointer;
+      user-select: none;
+      padding: 3px 0 3px 0;
+    }
+    .tree-dir-label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px 2px calc(var(--depth, 0) * 14px + 8px);
+      border-radius: 3px;
+      color: var(--text-secondary);
+    }
+    .tree-dir-label:hover { background: rgba(99,102,241,0.08); color: var(--text-primary); }
+    .tree-dir-label .arrow { font-size: 8px; width: 10px; text-align: center; transition: transform 0.15s; }
+    .tree-dir.collapsed > .tree-children { display: none; }
+    .tree-dir.collapsed > .tree-dir-label .arrow { transform: rotate(-90deg); }
+    .tree-file {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px 2px calc(var(--depth, 0) * 14px + 8px);
+      cursor: pointer;
+      border-radius: 3px;
+      color: var(--text-secondary);
+    }
+    .tree-file:hover { background: rgba(99,102,241,0.08); color: var(--text-primary); }
+    .tree-file.active { background: rgba(99,102,241,0.15); color: var(--accent); }
+    .tree-count { margin-left: auto; color: var(--text-dim); font-size: 10px; }
+
+    /* Canvas */
+    #graph-container {
+      grid-column: 2;
+      grid-row: 2;
+      position: relative;
+      overflow: hidden;
+      background: var(--bg-primary);
+    }
+    #graph-canvas { display: block; width: 100%; height: 100%; }
+
+    /* Tooltip */
+    #tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(17,17,24,0.95);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 12px;
+      z-index: 30;
+      display: none;
+      max-width: 320px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    }
+    #tooltip .tt-name { font-weight: 600; color: var(--text-primary); margin-bottom: 2px; }
+    #tooltip .tt-type { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-bottom: 4px; }
+    #tooltip .tt-meta { color: var(--text-secondary); font-size: 11px; }
+
+    /* Detail Panel */
+    #detail-panel {
+      grid-column: 3;
+      grid-row: 2;
+      background: var(--bg-secondary);
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 16px;
+      font-size: 13px;
+      display: none;
+      z-index: 10;
+    }
+    .detail-open #detail-panel { display: block; }
+    #detail-panel::-webkit-scrollbar { width: 4px; }
+    #detail-panel::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .detail-close {
+      float: right;
+      cursor: pointer;
+      color: var(--text-dim);
+      font-size: 18px;
+      line-height: 1;
+      padding: 2px 6px;
+      border-radius: 3px;
+    }
+    .detail-close:hover { background: var(--border); color: var(--text-primary); }
+    .detail-name { font-size: 18px; font-weight: 700; margin-bottom: 4px; word-break: break-all; }
+    .detail-type-badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+    .detail-row { margin-bottom: 6px; color: var(--text-secondary); }
+    .detail-row span { color: var(--text-primary); }
+    .detail-sig {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 10px;
+      font-family: 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 11px;
+      margin: 8px 0;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: var(--accent-hover);
+    }
+    .detail-section-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      margin: 14px 0 6px;
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+    }
+    .detail-edge-item {
+      padding: 3px 0;
+      cursor: pointer;
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+    .detail-edge-item:hover { color: var(--accent-hover); }
+    .detail-edge-type { font-size: 10px; color: var(--text-dim); }
+
+    /* Code Inspector Panel */
+    .detail-code-container {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      margin: 8px 0;
+      overflow: auto;
+      max-height: 400px;
+    }
+    .detail-code-container::-webkit-scrollbar { width: 4px; height: 4px; }
+    .detail-code-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    .detail-code-table {
+      border-collapse: collapse;
+      font-family: 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      width: 100%;
+    }
+    .detail-code-table td { padding: 0 8px; white-space: pre; }
+    .detail-code-table .line-num {
+      color: var(--text-dim);
+      text-align: right;
+      user-select: none;
+      width: 1%;
+      padding-right: 12px;
+      border-right: 1px solid var(--border);
+    }
+    .detail-code-table .line-content { color: var(--text-secondary); }
+    .detail-code-table tr.highlighted .line-num { color: var(--accent); }
+    .detail-code-table tr.highlighted .line-content { color: var(--text-primary); background: rgba(99,102,241,0.06); }
+
+    /* Filter Bar */
+    #filters {
+      grid-column: 1 / -1;
+      grid-row: 3;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 16px;
+      background: var(--bg-secondary);
+      border-top: 1px solid var(--border);
+      overflow-x: auto;
+      z-index: 20;
+      flex-wrap: nowrap;
+    }
+    .filter-label {
+      font-size: 10px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+      margin-right: 2px;
+    }
+    .filter-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+      user-select: none;
+      color: var(--text-dim);
+      background: transparent;
+      transition: all 0.15s;
+    }
+    .filter-chip.active {
+      border-color: var(--accent);
+      color: var(--text-primary);
+      background: rgba(99,102,241,0.1);
+    }
+    .filter-chip:hover { border-color: var(--accent-hover); }
+    .filter-chip .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .filter-sep {
+      width: 1px;
+      height: 20px;
+      background: var(--border);
+      margin: 0 4px;
+    }
+
+    /* Landing / drop zone */
+    #landing {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-primary);
+      z-index: 100;
+    }
+    #landing.hidden { display: none; }
+    .landing-title { font-size: 28px; font-weight: 700; color: var(--accent); margin-bottom: 8px; }
+    .landing-sub { color: var(--text-secondary); font-size: 14px; margin-bottom: 28px; }
+    .drop-zone {
+      width: 400px;
+      height: 180px;
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: var(--text-dim);
+      font-size: 14px;
+      transition: border-color 0.2s, background 0.2s;
+    }
+    .drop-zone.drag-over { border-color: var(--accent); background: rgba(99,102,241,0.05); }
+    .drop-zone-icon { font-size: 36px; }
+    .file-btn {
+      padding: 8px 24px;
+      border-radius: 6px;
+      border: none;
+      background: var(--accent);
+      color: #fff;
+      font-size: 13px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .file-btn:hover { background: var(--accent-hover); }
+    .landing-or { color: var(--text-dim); font-size: 12px; margin: 16px 0 4px; }
+    .landing-hint { color: var(--text-dim); font-size: 12px; }
+
+    /* Stats modal */
+    #stats-modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.6);
+      z-index: 200;
+    }
+    #stats-modal.visible { display: flex; }
+    .stats-content {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+      min-width: 320px;
+      max-width: 460px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    }
+    .stats-title { font-size: 16px; font-weight: 700; margin-bottom: 14px; }
+    .stats-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+    .stats-row .label { color: var(--text-secondary); }
+    .stats-row .value { color: var(--text-primary); font-weight: 600; }
+    .stats-section { font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin: 12px 0 4px; letter-spacing: 0.5px; }
+    .stats-close {
+      margin-top: 16px;
+      width: 100%;
+      padding: 7px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .stats-close:hover { background: var(--border); }
+  </style>
+</head>
+<body>
+
+<!-- Landing Screen -->
+<div id="landing">
+  <div class="landing-title">Universe</div>
+  <div class="landing-sub">Interactive Knowledge Graph Visualizer</div>
+  <div class="drop-zone" id="drop-zone">
+    <div class="drop-zone-icon">📂</div>
+    <div>Drag &amp; drop <strong>graph.json</strong> here</div>
+    <button class="file-btn" id="file-btn">Choose File</button>
+    <input type="file" id="file-input" accept=".json" style="display:none">
+  </div>
+  <div class="landing-or">or</div>
+  <div class="landing-hint">Auto-loading from <code>.universe/graph.json</code>...</div>
+</div>
+
+<!-- Stats Modal -->
+<div id="stats-modal">
+  <div class="stats-content">
+    <div class="stats-title">📊 Graph Statistics</div>
+    <div id="stats-body"></div>
+    <button class="stats-close" onclick="document.getElementById('stats-modal').classList.remove('visible')">Close</button>
+  </div>
+</div>
+
+<!-- Main App -->
+<div id="app">
+  <!-- Toolbar -->
+  <div id="toolbar">
+    <div class="logo">◆ Universe</div>
+    <input type="text" id="search-box" placeholder="🔍  Search nodes... ( / )" autocomplete="off">
+    <div class="toolbar-stats" id="toolbar-stats"></div>
+    <button class="toolbar-btn" id="btn-stats">📊 Stats</button>
+    <button class="toolbar-btn" id="btn-relayout">🔄 Re-layout</button>
+    <button class="toolbar-btn" id="btn-sidebar">☰ Sidebar</button>
+    <button class="toolbar-btn" id="btn-load">📥 Load JSON</button>
+    <input type="file" id="file-input2" accept=".json" style="display:none">
+  </div>
+
+  <!-- Sidebar -->
+  <div id="sidebar"></div>
+
+  <!-- Graph Canvas -->
+  <div id="graph-container">
+    <canvas id="graph-canvas"></canvas>
+    <div id="tooltip">
+      <div class="tt-name"></div>
+      <div class="tt-type"></div>
+      <div class="tt-meta"></div>
+    </div>
+  </div>
+
+  <!-- Detail Panel -->
+  <div id="detail-panel"></div>
+
+  <!-- Filter Bar -->
+  <div id="filters"></div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // ─── Color Maps ──────────────────────────────────────────────
+  const nodeColors = {
+    package:   '#6366F1',
+    file:      '#8B5CF6',
+    function:  '#3B82F6',
+    method:    '#06B6D4',
+    struct:    '#10B981',
+    interface: '#F59E0B',
+    type:      '#EC4899',
+    variable:  '#EF4444',
+    import:    '#64748B',
+    class:     '#14B8A6',
+    module:    '#A855F7',
+  };
+
+  const edgeColors = {
+    imports:     'rgba(100, 116, 139, 0.15)',
+    calls:       'rgba(59, 130, 246, 0.3)',
+    implements:  'rgba(245, 158, 11, 0.4)',
+    depends_on:  'rgba(239, 68, 68, 0.4)',
+    contains:    'rgba(99, 102, 241, 0.1)',
+    returns:     'rgba(16, 185, 129, 0.2)',
+    receives:    'rgba(20, 184, 166, 0.2)',
+    inherits:    'rgba(168, 85, 247, 0.4)',
+  };
+
+  const edgeHighlightColors = {
+    imports:     'rgba(100, 116, 139, 0.6)',
+    calls:       'rgba(59, 130, 246, 0.7)',
+    implements:  'rgba(245, 158, 11, 0.8)',
+    depends_on:  'rgba(239, 68, 68, 0.8)',
+    contains:    'rgba(99, 102, 241, 0.5)',
+    returns:     'rgba(16, 185, 129, 0.6)',
+    receives:    'rgba(20, 184, 166, 0.6)',
+    inherits:    'rgba(168, 85, 247, 0.8)',
+  };
+
+  // ─── State ───────────────────────────────────────────────────
+  let allNodes = [];
+  let allEdges = [];
+  let rawJson = null;
+  let nodes = [];
+  let edges = [];
+  let simulation = null;
+  let transform = d3.zoomIdentity;
+  let hoveredNode = null;
+  let selectedNode = null;
+  let searchQuery = '';
+  let highlightedNodeIds = new Set();
+  let neighborSet = new Set();
+  let connectedEdgeSet = new Set();
+  let quadtree = null;
+  let sidebarVisible = true;
+
+  const activeNodeTypes = new Set(['package', 'function', 'method', 'struct', 'interface', 'class', 'module', 'file', 'type']);
+  const activeEdgeTypes = new Set(['calls', 'depends_on', 'implements', 'inherits', 'returns', 'receives']);
+
+  const allNodeTypes = ['package', 'module', 'file', 'function', 'method', 'struct', 'interface', 'class', 'type', 'variable', 'import'];
+  const allEdgeTypes = ['calls', 'depends_on', 'implements', 'imports', 'contains', 'inherits', 'returns', 'receives'];
+
+  // ─── DOM refs ────────────────────────────────────────────────
+  const app = document.getElementById('app');
+  const canvas = document.getElementById('graph-canvas');
+  const ctx = canvas.getContext('2d');
+  const container = document.getElementById('graph-container');
+  const tooltip = document.getElementById('tooltip');
+  const landing = document.getElementById('landing');
+  const searchBox = document.getElementById('search-box');
+  const toolbarStats = document.getElementById('toolbar-stats');
+  const sidebar = document.getElementById('sidebar');
+  const detailPanel = document.getElementById('detail-panel');
+  const filtersBar = document.getElementById('filters');
+
+  // ─── Canvas sizing ──────────────────────────────────────────
+  let width, height, dpr;
+
+  function resizeCanvas() {
+    dpr = window.devicePixelRatio || 1;
+    const rect = container.getBoundingClientRect();
+    width = rect.width;
+    height = rect.height;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    canvas.style.width = width + 'px';
+    canvas.style.height = height + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    requestRender();
+  }
+  window.addEventListener('resize', resizeCanvas);
+
+  // ─── Graph Loading ──────────────────────────────────────────
+  function parseGraph(json) {
+    rawJson = json;
+    const nodesObj = json.nodes || {};
+    const edgesArr = json.edges || [];
+    const filesObj = json.files || {};
+
+    const nodesArray = Object.values(nodesObj).filter(n => n && n.id);
+    const edgesArray = edgesArr.filter(e => e && e.from && e.to);
+
+    const degree = {};
+    edgesArray.forEach(e => {
+      degree[e.from] = (degree[e.from] || 0) + 1;
+      degree[e.to] = (degree[e.to] || 0) + 1;
+    });
+
+    const maxDegree = Math.max(...Object.values(degree), 1);
+    nodesArray.forEach(n => {
+      n.degree = degree[n.id] || 0;
+      n.size = 2 + (n.degree / maxDegree) * 12;
+      n.color = nodeColors[n.type] || '#666';
+      if (n.file_path) {
+        n.file_path = n.file_path.replace(/\\/g, '/');
+      }
+    });
+
+    const nodeMap = {};
+    nodesArray.forEach(n => { nodeMap[n.id] = n; });
+
+    const validEdges = edgesArray
+      .filter(e => nodeMap[e.from] && nodeMap[e.to])
+      .map(e => ({
+        source: e.from,
+        target: e.to,
+        type: e.type,
+        metadata: e.metadata || {},
+        color: edgeColors[e.type] || 'rgba(255,255,255,0.05)',
+      }));
+
+    allNodes = nodesArray;
+    allEdges = validEdges;
+
+    applyFilters();
+    buildSidebar();
+    buildFilters();
+    updateStats();
+    landing.classList.add('hidden');
+    resizeCanvas();
+    startSimulation();
+  }
+
+  function applyFilters() {
+    const nodeIdSet = new Set();
+    nodes = allNodes.filter(n => {
+      if (!activeNodeTypes.has(n.type)) return false;
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        const match =
+          (n.name && n.name.toLowerCase().includes(q)) ||
+          (n.package && n.package.toLowerCase().includes(q)) ||
+          (n.id && n.id.toLowerCase().includes(q)) ||
+          (n.file_path && n.file_path.toLowerCase().includes(q));
+        if (!match) return false;
+      }
+      nodeIdSet.add(n.id);
+      return true;
+    });
+
+    edges = allEdges.filter(e => {
+      if (!activeEdgeTypes.has(e.type)) return false;
+      const srcId = typeof e.source === 'object' ? e.source.id : e.source;
+      const tgtId = typeof e.target === 'object' ? e.target.id : e.target;
+      return nodeIdSet.has(srcId) && nodeIdSet.has(tgtId);
+    });
+  }
+
+  // ─── D3 Force Simulation ───────────────────────────────────
+  function startSimulation() {
+    const packages = {};
+    nodes.forEach(n => {
+      const pkg = n.package || '_none';
+      if (!packages[pkg]) packages[pkg] = [];
+      packages[pkg].push(n);
+    });
+    const packageNames = Object.keys(packages);
+    const packageCenters = {};
+    packageNames.forEach((pkg, i) => {
+      const angle = (2 * Math.PI * i) / packageNames.length;
+      const radius = Math.min(width, height) * 0.3;
+      packageCenters[pkg] = {
+        x: width / 2 + radius * Math.cos(angle),
+        y: height / 2 + radius * Math.sin(angle),
+      };
+    });
+
+    if (simulation) simulation.stop();
+
+    simulation = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(edges).id(d => d.id).distance(80).strength(0.3))
+      .force('charge', d3.forceManyBody().strength(-120).distanceMax(500))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+      .force('collision', d3.forceCollide().radius(d => d.size + 2))
+      .force('x', d3.forceX(width / 2).strength(0.05))
+      .force('y', d3.forceY(height / 2).strength(0.05))
+      .force('clusterX', d3.forceX().x(d => packageCenters[d.package || '_none']?.x || width / 2).strength(0.08))
+      .force('clusterY', d3.forceY().y(d => packageCenters[d.package || '_none']?.y || height / 2).strength(0.08))
+      .alphaDecay(0.02)
+      .on('tick', onTick);
+  }
+
+  function onTick() {
+    quadtree = d3.quadtree()
+      .x(d => d.x)
+      .y(d => d.y)
+      .addAll(nodes);
+    requestRender();
+  }
+
+  // ─── Rendering ──────────────────────────────────────────────
+  let renderQueued = false;
+  function requestRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(render);
+  }
+
+  function render() {
+    renderQueued = false;
+    ctx.save();
+    ctx.clearRect(0, 0, width, height);
+    ctx.translate(transform.x, transform.y);
+    ctx.scale(transform.k, transform.k);
+
+    const zoomLevel = transform.k;
+    const vx0 = -transform.x / transform.k;
+    const vy0 = -transform.y / transform.k;
+    const vx1 = (width - transform.x) / transform.k;
+    const vy1 = (height - transform.y) / transform.k;
+    const pad = 40;
+
+    const hasHighlight = hoveredNode || selectedNode || highlightedNodeIds.size > 0;
+
+    // Edges
+    edges.forEach((edge, i) => {
+      const s = typeof edge.source === 'object' ? edge.source : null;
+      const t = typeof edge.target === 'object' ? edge.target : null;
+      if (!s || !t) return;
+      if (s.x < vx0 - pad && t.x < vx0 - pad) return;
+      if (s.x > vx1 + pad && t.x > vx1 + pad) return;
+      if (s.y < vy0 - pad && t.y < vy0 - pad) return;
+      if (s.y > vy1 + pad && t.y > vy1 + pad) return;
+
+      const isConnected = connectedEdgeSet.has(i);
+
+      if (hasHighlight && !isConnected) {
+        if (zoomLevel < 1.5) return;
+        ctx.globalAlpha = 0.05;
+      } else {
+        ctx.globalAlpha = 1;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(s.x, s.y);
+      ctx.lineTo(t.x, t.y);
+      ctx.strokeStyle = isConnected ? (edgeHighlightColors[edge.type] || 'rgba(255,255,255,0.4)') : edge.color;
+      ctx.lineWidth = isConnected ? 2 : 0.5;
+      ctx.stroke();
+    });
+
+    ctx.globalAlpha = 1;
+
+    // Nodes
+    const showLabelsZoom = zoomLevel > 0.6;
+    nodes.forEach(n => {
+      if (n.x < vx0 - pad || n.x > vx1 + pad || n.y < vy0 - pad || n.y > vy1 + pad) return;
+
+      const isHighlighted = !hasHighlight || neighborSet.has(n.id) || highlightedNodeIds.has(n.id);
+      const isSelected = selectedNode && selectedNode.id === n.id;
+      const isHovered = hoveredNode && hoveredNode.id === n.id;
+
+      ctx.globalAlpha = isHighlighted ? 1 : 0.12;
+
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, n.size, 0, 2 * Math.PI);
+      ctx.fillStyle = (isSelected || isHovered) ? brighten(n.color) : n.color;
+      ctx.fill();
+
+      if (isSelected || isHovered) {
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+
+      if (showLabelsZoom && (n.size > 4 || isHovered || isSelected || (zoomLevel > 1.5))) {
+        ctx.globalAlpha = isHighlighted ? 0.9 : 0.08;
+        ctx.fillStyle = '#e0e0e0';
+        const fontSize = Math.max(8, Math.min(n.size * 1.5, 14));
+        ctx.font = `${fontSize}px -apple-system, sans-serif`;
+        ctx.fillText(n.name, n.x + n.size + 3, n.y + fontSize / 3);
+      }
+    });
+
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function brighten(hex) {
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return `rgb(${Math.min(255, r + 60)}, ${Math.min(255, g + 60)}, ${Math.min(255, b + 60)})`;
+  }
+
+  // ─── Zoom & Pan ─────────────────────────────────────────────
+  const zoom = d3.zoom()
+    .scaleExtent([0.05, 10])
+    .on('zoom', (event) => {
+      transform = event.transform;
+      requestRender();
+    });
+
+  function initZoom() {
+    d3.select(canvas)
+      .call(zoom)
+      .on('dblclick.zoom', null);
+  }
+
+  function resetZoom() {
+    if (nodes.length === 0) return;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    nodes.forEach(n => {
+      if (n.x < minX) minX = n.x;
+      if (n.x > maxX) maxX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.y > maxY) maxY = n.y;
+    });
+    const graphW = maxX - minX + 100;
+    const graphH = maxY - minY + 100;
+    const scale = Math.min(width / graphW, height / graphH, 2) * 0.9;
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    const t = d3.zoomIdentity.translate(width / 2, height / 2).scale(scale).translate(-cx, -cy);
+    d3.select(canvas).transition().duration(600).call(zoom.transform, t);
+  }
+
+  function zoomToNode(node) {
+    const t = d3.zoomIdentity.translate(width / 2, height / 2).scale(2.5).translate(-node.x, -node.y);
+    d3.select(canvas).transition().duration(500).call(zoom.transform, t);
+  }
+
+  // ─── Hit Detection ─────────────────────────────────────────
+  function findNodeAt(mx, my) {
+    const px = (mx - transform.x) / transform.k;
+    const py = (my - transform.y) / transform.k;
+    if (!quadtree) return null;
+    let found = null;
+    let bestDist = Infinity;
+    const radius = 20 / transform.k;
+    quadtree.visit((quad, x0, y0, x1, y1) => {
+      if (x0 > px + radius || x1 < px - radius || y0 > py + radius || y1 < py - radius) return true;
+      if (quad.data) {
+        const dx = quad.data.x - px;
+        const dy = quad.data.y - py;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < Math.max(quad.data.size, 5) + 4 / transform.k && dist < bestDist) {
+          bestDist = dist;
+          found = quad.data;
+        }
+      }
+    });
+    return found;
+  }
+
+  function computeNeighbors(node) {
+    neighborSet.clear();
+    connectedEdgeSet.clear();
+    if (!node) return;
+    neighborSet.add(node.id);
+    edges.forEach((e, i) => {
+      const sid = typeof e.source === 'object' ? e.source.id : e.source;
+      const tid = typeof e.target === 'object' ? e.target.id : e.target;
+      if (sid === node.id || tid === node.id) {
+        neighborSet.add(sid);
+        neighborSet.add(tid);
+        connectedEdgeSet.add(i);
+      }
+    });
+  }
+
+  // ─── Mouse Interaction ─────────────────────────────────────
+  canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const node = findNodeAt(mx, my);
+
+    if (node !== hoveredNode) {
+      hoveredNode = node;
+      if (node && !selectedNode) {
+        computeNeighbors(node);
+        showTooltip(node, e.clientX, e.clientY);
+      } else if (!node && !selectedNode) {
+        neighborSet.clear();
+        connectedEdgeSet.clear();
+        hideTooltip();
+      } else if (node) {
+        showTooltip(node, e.clientX, e.clientY);
+      } else {
+        hideTooltip();
+      }
+      requestRender();
+    } else if (node) {
+      positionTooltip(e.clientX, e.clientY);
+    }
+
+    canvas.style.cursor = node ? 'pointer' : 'grab';
+  });
+
+  canvas.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const node = findNodeAt(e.clientX - rect.left, e.clientY - rect.top);
+    if (node) {
+      selectNode(node);
+    } else {
+      deselectNode();
+    }
+  });
+
+  canvas.addEventListener('dblclick', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const node = findNodeAt(e.clientX - rect.left, e.clientY - rect.top);
+    if (node) {
+      selectNode(node);
+      zoomToNode(node);
+    }
+  });
+
+  // ─── Tooltip ────────────────────────────────────────────────
+  function showTooltip(node, cx, cy) {
+    tooltip.querySelector('.tt-name').textContent = node.name;
+    const badge = tooltip.querySelector('.tt-type');
+    badge.textContent = node.type;
+    badge.style.background = node.color;
+    badge.style.color = '#fff';
+    let meta = '';
+    if (node.package) meta += `Package: ${node.package}\n`;
+    if (node.file_path) meta += `File: ${node.file_path}\n`;
+    if (node.start_line) meta += `Lines: ${node.start_line}–${node.end_line}`;
+    tooltip.querySelector('.tt-meta').textContent = meta;
+    tooltip.style.display = 'block';
+    positionTooltip(cx, cy);
+  }
+
+  function positionTooltip(cx, cy) {
+    const tw = tooltip.offsetWidth;
+    const th = tooltip.offsetHeight;
+    let left = cx + 14;
+    let top = cy - 10;
+    if (left + tw > window.innerWidth - 8) left = cx - tw - 14;
+    if (top + th > window.innerHeight - 8) top = window.innerHeight - th - 8;
+    if (top < 8) top = 8;
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+  }
+
+  function hideTooltip() {
+    tooltip.style.display = 'none';
+  }
+
+  // ─── Selection & Detail Panel ──────────────────────────────
+  function selectNode(node) {
+    selectedNode = node;
+    computeNeighbors(node);
+    highlightedNodeIds.clear();
+    showDetailPanel(node);
+    app.classList.add('detail-open');
+    requestRender();
+    setTimeout(resizeCanvas, 200);
+  }
+
+  function deselectNode() {
+    selectedNode = null;
+    neighborSet.clear();
+    connectedEdgeSet.clear();
+    highlightedNodeIds.clear();
+    app.classList.remove('detail-open');
+    requestRender();
+    setTimeout(resizeCanvas, 200);
+  }
+
+  function showDetailPanel(node) {
+    const incoming = [];
+    const outgoing = [];
+    edges.forEach(e => {
+      const sid = typeof e.source === 'object' ? e.source.id : e.source;
+      const tid = typeof e.target === 'object' ? e.target.id : e.target;
+      if (tid === node.id) {
+        const src = allNodes.find(n => n.id === sid);
+        if (src) incoming.push({ node: src, type: e.type });
+      }
+      if (sid === node.id) {
+        const tgt = allNodes.find(n => n.id === tid);
+        if (tgt) outgoing.push({ node: tgt, type: e.type });
+      }
+    });
+
+    let html = `<span class="detail-close" id="detail-close">&times;</span>`;
+    html += `<div class="detail-name">${esc(node.name)}</div>`;
+    html += `<div class="detail-type-badge" style="background:${node.color};color:#fff">${esc(node.type)}</div>`;
+    if (node.package) html += `<div class="detail-row">Package: <span>${esc(node.package)}</span></div>`;
+    if (node.file_path) html += `<div class="detail-row">File: <span>${esc(node.file_path)}</span></div>`;
+    if (node.start_line) html += `<div class="detail-row">Lines: <span>${node.start_line} – ${node.end_line}</span></div>`;
+    if (node.degree !== undefined) html += `<div class="detail-row">Connections: <span>${node.degree}</span></div>`;
+
+    if (node.signature) {
+      html += `<div class="detail-section-title">Signature</div>`;
+      html += `<div class="detail-sig">${esc(node.signature)}</div>`;
+    }
+
+    if (node.metadata && Object.keys(node.metadata).length > 0) {
+      html += `<div class="detail-section-title">Metadata</div>`;
+      for (const [k, v] of Object.entries(node.metadata)) {
+        html += `<div class="detail-row">${esc(k)}: <span>${esc(v)}</span></div>`;
+      }
+    }
+
+    // Code Inspector
+    if (rawJson && rawJson.files && node.file_path) {
+      const normPath = node.file_path.replace(/\\/g, '/');
+      const fileInfo = rawJson.files[normPath];
+      if (fileInfo && fileInfo.content) {
+        html += `<div class="detail-section-title">Code Inspector</div>`;
+        html += buildCodeView(fileInfo.content, node.start_line, node.end_line);
+      }
+    }
+
+    if (incoming.length > 0) {
+      html += `<div class="detail-section-title">Incoming (${incoming.length})</div>`;
+      incoming.forEach(item => {
+        html += `<div class="detail-edge-item" data-node-id="${esc(item.node.id)}">↑ ${esc(item.node.name)} <span class="detail-edge-type">[${esc(item.type)}]</span></div>`;
+      });
+    }
+
+    if (outgoing.length > 0) {
+      html += `<div class="detail-section-title">Outgoing (${outgoing.length})</div>`;
+      outgoing.forEach(item => {
+        html += `<div class="detail-edge-item" data-node-id="${esc(item.node.id)}">→ ${esc(item.node.name)} <span class="detail-edge-type">[${esc(item.type)}]</span></div>`;
+      });
+    }
+
+    detailPanel.innerHTML = html;
+
+    document.getElementById('detail-close').addEventListener('click', deselectNode);
+
+    detailPanel.querySelectorAll('.detail-edge-item').forEach(el => {
+      el.addEventListener('click', () => {
+        const id = el.dataset.nodeId;
+        const target = allNodes.find(n => n.id === id);
+        if (target) {
+          selectNode(target);
+          zoomToNode(target);
+        }
+      });
+    });
+  }
+
+  function buildCodeView(content, startLine, endLine) {
+    const lines = content.split('\n');
+    const contextBefore = 5;
+    const contextAfter = 5;
+    const from = Math.max(0, (startLine || 1) - 1 - contextBefore);
+    const to = Math.min(lines.length, (endLine || startLine || lines.length) + contextAfter);
+
+    let html = '<div class="detail-code-container"><table class="detail-code-table">';
+    for (let i = from; i < to; i++) {
+      const lineNum = i + 1;
+      const isHighlighted = startLine && endLine && lineNum >= startLine && lineNum <= endLine;
+      html += `<tr class="${isHighlighted ? 'highlighted' : ''}">`;
+      html += `<td class="line-num">${lineNum}</td>`;
+      html += `<td class="line-content">${esc(lines[i] || '')}</td>`;
+      html += `</tr>`;
+    }
+    html += '</table></div>';
+    return html;
+  }
+
+  function esc(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // ─── Sidebar File Tree ─────────────────────────────────────
+  function buildSidebar() {
+    const tree = buildFileTree(allNodes);
+    sidebar.innerHTML = renderTree(tree, 0);
+
+    sidebar.querySelectorAll('.tree-dir-label').forEach(el => {
+      el.addEventListener('click', (e) => {
+        const dir = el.closest('.tree-dir');
+        dir.classList.toggle('collapsed');
+        e.stopPropagation();
+      });
+    });
+
+    sidebar.querySelectorAll('.tree-file').forEach(el => {
+      el.addEventListener('click', () => {
+        sidebar.querySelectorAll('.tree-file.active').forEach(f => f.classList.remove('active'));
+        el.classList.add('active');
+        const fp = el.dataset.filePath;
+        highlightedNodeIds.clear();
+        neighborSet.clear();
+        connectedEdgeSet.clear();
+        allNodes.forEach(n => {
+          if (n.file_path && normalizeSlash(n.file_path) === normalizeSlash(fp)) {
+            highlightedNodeIds.add(n.id);
+          }
+        });
+        if (highlightedNodeIds.size > 0) {
+          neighborSet = new Set(highlightedNodeIds);
+        }
+        requestRender();
+      });
+    });
+  }
+
+  function normalizeSlash(p) { return p ? p.replace(/\\/g, '/') : ''; }
+
+  function buildFileTree(nodesList) {
+    const tree = {};
+    nodesList.forEach(n => {
+      if (!n.file_path) return;
+      const fp = normalizeSlash(n.file_path);
+      const parts = fp.split('/');
+      let current = tree;
+      parts.forEach((part, i) => {
+        if (i === parts.length - 1) {
+          if (!current[part]) current[part] = { _nodes: [], _path: fp };
+          current[part]._nodes.push(n);
+        } else {
+          if (!current[part] || current[part]._nodes) {
+            if (!current[part]) current[part] = {};
+          }
+          current = current[part];
+        }
+      });
+    });
+    return tree;
+  }
+
+  function renderTree(tree, depth) {
+    let html = '';
+    const dirs = [];
+    const files = [];
+
+    for (const key of Object.keys(tree).sort()) {
+      if (key === '_nodes' || key === '_path') continue;
+      if (tree[key]._nodes) {
+        files.push(key);
+      } else {
+        dirs.push(key);
+      }
+    }
+
+    dirs.forEach(name => {
+      const count = countNodes(tree[name]);
+      html += `<div class="tree-dir" style="--depth:${depth}">`;
+      html += `<div class="tree-dir-label" style="--depth:${depth}"><span class="arrow">▼</span> 📁 ${esc(name)} <span class="tree-count">${count}</span></div>`;
+      html += `<div class="tree-children">${renderTree(tree[name], depth + 1)}</div>`;
+      html += `</div>`;
+    });
+
+    files.forEach(name => {
+      const entry = tree[name];
+      const count = entry._nodes ? entry._nodes.length : 0;
+      const filePath = entry._path || '';
+      html += `<div class="tree-file" style="--depth:${depth}" data-file-path="${esc(filePath)}">📄 ${esc(name)} <span class="tree-count">${count}</span></div>`;
+    });
+
+    return html;
+  }
+
+  function countNodes(subtree) {
+    let count = 0;
+    for (const key of Object.keys(subtree)) {
+      if (key === '_nodes') { count += subtree[key].length; continue; }
+      if (key === '_path') continue;
+      count += countNodes(subtree[key]);
+    }
+    return count;
+  }
+
+  // ─── Filter Bar ─────────────────────────────────────────────
+  function buildFilters() {
+    let html = '<span class="filter-label">Nodes:</span>';
+
+    allNodeTypes.forEach(t => {
+      const active = activeNodeTypes.has(t);
+      const color = nodeColors[t] || '#666';
+      html += `<div class="filter-chip ${active ? 'active' : ''}" data-filter="node" data-type="${t}">`;
+      html += `<span class="dot" style="background:${color}"></span>${t}`;
+      html += `</div>`;
+    });
+
+    html += '<div class="filter-sep"></div><span class="filter-label">Edges:</span>';
+
+    allEdgeTypes.forEach(t => {
+      const active = activeEdgeTypes.has(t);
+      html += `<div class="filter-chip ${active ? 'active' : ''}" data-filter="edge" data-type="${t}">`;
+      html += `${t}`;
+      html += `</div>`;
+    });
+
+    filtersBar.innerHTML = html;
+
+    filtersBar.querySelectorAll('.filter-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const kind = chip.dataset.filter;
+        const type = chip.dataset.type;
+        const set = kind === 'node' ? activeNodeTypes : activeEdgeTypes;
+        if (set.has(type)) {
+          set.delete(type);
+          chip.classList.remove('active');
+        } else {
+          set.add(type);
+          chip.classList.add('active');
+        }
+        applyFilters();
+        startSimulation();
+      });
+    });
+  }
+
+  // ─── Stats ──────────────────────────────────────────────────
+  function updateStats() {
+    toolbarStats.textContent = `Nodes: ${allNodes.length} | Edges: ${allEdges.length}`;
+  }
+
+  function showStats() {
+    const nodesByType = {};
+    const edgesByType = {};
+    const packages = new Set();
+    const files = new Set();
+    allNodes.forEach(n => {
+      nodesByType[n.type] = (nodesByType[n.type] || 0) + 1;
+      if (n.package) packages.add(n.package);
+      if (n.file_path) files.add(n.file_path);
+    });
+    allEdges.forEach(e => {
+      edgesByType[e.type] = (edgesByType[e.type] || 0) + 1;
+    });
+
+    let html = '';
+    html += `<div class="stats-row"><span class="label">Total nodes</span><span class="value">${allNodes.length}</span></div>`;
+    html += `<div class="stats-row"><span class="label">Total edges</span><span class="value">${allEdges.length}</span></div>`;
+    html += `<div class="stats-row"><span class="label">Packages/Modules</span><span class="value">${packages.size}</span></div>`;
+    html += `<div class="stats-row"><span class="label">Source files</span><span class="value">${files.size}</span></div>`;
+
+    html += `<div class="stats-section">Nodes by type</div>`;
+    Object.keys(nodesByType).sort().forEach(t => {
+      html += `<div class="stats-row"><span class="label">${t}</span><span class="value">${nodesByType[t]}</span></div>`;
+    });
+
+    html += `<div class="stats-section">Edges by type</div>`;
+    Object.keys(edgesByType).sort().forEach(t => {
+      html += `<div class="stats-row"><span class="label">${t}</span><span class="value">${edgesByType[t]}</span></div>`;
+    });
+
+    document.getElementById('stats-body').innerHTML = html;
+    document.getElementById('stats-modal').classList.add('visible');
+  }
+
+  // ─── Search ─────────────────────────────────────────────────
+  searchBox.addEventListener('input', () => {
+    searchQuery = searchBox.value.trim();
+    applyFilters();
+    startSimulation();
+  });
+
+  // ─── Toolbar Buttons ───────────────────────────────────────
+  document.getElementById('btn-stats').addEventListener('click', showStats);
+  document.getElementById('btn-relayout').addEventListener('click', () => {
+    applyFilters();
+    startSimulation();
+    setTimeout(resetZoom, 800);
+  });
+  document.getElementById('btn-load').addEventListener('click', () => {
+    document.getElementById('file-input2').click();
+  });
+  document.getElementById('file-input2').addEventListener('change', handleFileInput);
+  document.getElementById('btn-sidebar').addEventListener('click', () => {
+    sidebarVisible = !sidebarVisible;
+    app.classList.toggle('sidebar-hidden', !sidebarVisible);
+    setTimeout(resizeCanvas, 200);
+  });
+
+  // ─── Keyboard Shortcuts ────────────────────────────────────
+  document.addEventListener('keydown', (e) => {
+    if (e.target === searchBox) {
+      if (e.key === 'Escape') {
+        searchBox.value = '';
+        searchQuery = '';
+        searchBox.blur();
+        applyFilters();
+        startSimulation();
+      }
+      return;
+    }
+
+    switch (e.key) {
+      case '/':
+      case 'f':
+        e.preventDefault();
+        searchBox.focus();
+        break;
+      case 'Escape':
+        deselectNode();
+        highlightedNodeIds.clear();
+        neighborSet.clear();
+        connectedEdgeSet.clear();
+        sidebar.querySelectorAll('.tree-file.active').forEach(f => f.classList.remove('active'));
+        requestRender();
+        break;
+      case '+':
+      case '=':
+        d3.select(canvas).transition().duration(300).call(zoom.scaleBy, 1.3);
+        break;
+      case '-':
+        d3.select(canvas).transition().duration(300).call(zoom.scaleBy, 0.7);
+        break;
+      case '0':
+        resetZoom();
+        break;
+      case 'h':
+      case 'H':
+        sidebarVisible = !sidebarVisible;
+        app.classList.toggle('sidebar-hidden', !sidebarVisible);
+        setTimeout(resizeCanvas, 200);
+        break;
+      case 'l':
+      case 'L':
+        applyFilters();
+        startSimulation();
+        setTimeout(resetZoom, 800);
+        break;
+    }
+  });
+
+  // ─── File Loading ──────────────────────────────────────────
+  function handleFileInput(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    readJsonFile(file);
+  }
+
+  function readJsonFile(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const json = JSON.parse(e.target.result);
+        parseGraph(json);
+        setTimeout(resetZoom, 800);
+      } catch (err) {
+        alert('Invalid JSON file: ' + err.message);
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  // Landing file input
+  document.getElementById('file-btn').addEventListener('click', () => {
+    document.getElementById('file-input').click();
+  });
+  document.getElementById('file-input').addEventListener('change', (e) => {
+    handleFileInput(e);
+  });
+
+  // Drag and drop
+  const dropZone = document.getElementById('drop-zone');
+  document.body.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    dropZone.classList.add('drag-over');
+  });
+  document.body.addEventListener('dragleave', () => {
+    dropZone.classList.remove('drag-over');
+  });
+  document.body.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    const file = e.dataTransfer.files[0];
+    if (file && file.name.endsWith('.json')) {
+      readJsonFile(file);
+    }
+  });
+
+  // Auto-load from .universe/graph.json
+  function tryAutoLoad() {
+    fetch('.universe/graph.json')
+      .then(r => {
+        if (!r.ok) throw new Error('Not found');
+        return r.json();
+      })
+      .then(json => {
+        parseGraph(json);
+        setTimeout(resetZoom, 800);
+      })
+      .catch(() => {
+        // also try graph.json in current dir
+        fetch('graph.json')
+          .then(r => {
+            if (!r.ok) throw new Error('Not found');
+            return r.json();
+          })
+          .then(json => {
+            parseGraph(json);
+            setTimeout(resetZoom, 800);
+          })
+          .catch(() => {});
+      });
+  }
+
+  // URL param ?file=path/to/graph.json
+  const urlParams = new URLSearchParams(window.location.search);
+  const fileParam = urlParams.get('file');
+  if (fileParam) {
+    fetch(fileParam)
+      .then(r => {
+        if (!r.ok) throw new Error('Not found');
+        return r.json();
+      })
+      .then(json => {
+        parseGraph(json);
+        setTimeout(resetZoom, 800);
+      })
+      .catch(() => tryAutoLoad());
+  } else {
+    tryAutoLoad();
+  }
+
+  // ─── Init ──────────────────────────────────────────────────
+  initZoom();
+  resizeCanvas();
+
+  // Close stats modal on backdrop click
+  document.getElementById('stats-modal').addEventListener('click', (e) => {
+    if (e.target === document.getElementById('stats-modal')) {
+      document.getElementById('stats-modal').classList.remove('visible');
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
