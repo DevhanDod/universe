@@ -5,160 +5,122 @@ import (
 	"strings"
 )
 
-// SkillMatcher finds the best skill for a task (implemented by Engine 3).
-type SkillMatcher interface {
-	Match(graphNodeIDs []string, taskText string) (*SkillMatch, error)
+// Router provides RECOMMENDATIONS to the planner agent.
+// It does NOT make routing decisions — the planner (premium model in
+// Cursor) reads the recommendations and decides what to do.
+//
+// Zero LLM calls. All database queries.
+
+// SkillChecker checks whether a matching skill exists.
+type SkillChecker interface {
+	HasMatch(graphNodeIDs []string, taskText string) (bool, string, string, float64, error)
+	// Returns: found, skillID, skillName, confidence, error
 }
 
-type SkillMatch struct {
-	SkillID      string
-	Name         string
-	Instruction  string
-	SuccessRate  float64
-	GraphOverlap float64
+// MemoryChecker checks whether relevant memory exists for a developer.
+type MemoryChecker interface {
+	HasRelevant(graphNodeIDs []string, developerID string) (bool, int, error)
+	// Returns: found, count, error
 }
 
-// MemoryRecaller retrieves relevant past observations (implemented by Engine 2).
-type MemoryRecaller interface {
-	QuickCheck(graphNodeIDs []string, developerID string) (*MemoryCheck, error)
-}
-
-type MemoryCheck struct {
-	HasExactMatch bool
-	Confidence    float64
-	Summary       string
-}
-
-// GraphAnalyzer provides structural complexity signals (adapter for Engine 1).
-type GraphAnalyzer interface {
+// GraphChecker provides structural complexity signals.
+type GraphChecker interface {
 	CountAffectedNodes(nodeIDs []string) (int, error)
 	IsCrossRepo(nodeIDs []string) (bool, error)
-	GetLanguage(nodeIDs []string) (string, error)
 }
 
-// Router decides how to handle each task without LLM calls.
+// Router holds references to the other engines for recommendation queries.
 type Router struct {
-	skills SkillMatcher
-	memory MemoryRecaller
-	graph  GraphAnalyzer
-	config Config
+	skills SkillChecker
+	memory MemoryChecker
+	graph  GraphChecker
 }
 
-func NewRouter(skills SkillMatcher, memory MemoryRecaller, graph GraphAnalyzer, config Config) *Router {
-	return &Router{skills: skills, memory: memory, graph: graph, config: config}
+// NewRouter creates a new recommendation router.
+// All parameters are optional (nil-safe).
+func NewRouter(skills SkillChecker, memory MemoryChecker, graph GraphChecker) *Router {
+	return &Router{skills: skills, memory: memory, graph: graph}
 }
 
-// Route makes the routing decision for a task. Zero LLM tokens.
-func (r *Router) Route(task Task) (*RoutingDecision, error) {
-	// 1. SKILL MATCH
-	if r.skills != nil && len(task.GraphNodeIDs) > 0 {
-		match, err := r.skills.Match(task.GraphNodeIDs, task.Prompt)
-		if err == nil && match != nil &&
-			match.SuccessRate >= r.config.SkillMatchMinSuccessRate &&
-			match.GraphOverlap >= 0.5 {
-			return &RoutingDecision{
-				Mode:           ModeSkillExecute,
-				PlannerRole:    "low_cost",
-				ExecutorRole:   "low_cost",
-				VerifierRole:   "automated",
-				NextStep:       "skill_execute",
-				VerifyTier:     VerifyAutomated,
-				SkipPlanning:   true,
-				MatchedSkillID: match.SkillID,
-				Reason:         "skill match: " + match.Name,
-			}, nil
+// Recommend analyzes a task and returns recommendations for the planner.
+// Zero LLM calls. All database queries.
+func (r *Router) Recommend(graphNodeIDs []string, taskText string, developerID string) (*RoutingRecommendation, error) {
+	rec := &RoutingRecommendation{}
+
+	// Check skills
+	if r.skills != nil {
+		found, skillID, skillName, confidence, err := r.skills.HasMatch(graphNodeIDs, taskText)
+		if err == nil && found {
+			rec.SkillAvailable = true
+			rec.SkillID = skillID
+			rec.SkillName = skillName
+			rec.SkillConfidence = confidence
 		}
 	}
 
-	// 2. MEMORY MATCH
+	// Check memory
 	if r.memory != nil {
-		check, err := r.memory.QuickCheck(task.GraphNodeIDs, task.DeveloperID)
-		if err == nil && check != nil &&
-			check.HasExactMatch && check.Confidence >= r.config.MemoryMatchMinConfidence {
-			return &RoutingDecision{
-				Mode:         ModeMemoryApply,
-				PlannerRole:  "low_cost",
-				ExecutorRole: "low_cost",
-				VerifierRole: "low_cost",
-				NextStep:     "memory_apply",
-				VerifyTier:   VerifySpotCheck,
-				SkipPlanning: true,
-				MemoryHit:    true,
-				Reason:       "memory hit: confidence " + fmtFloat(check.Confidence),
-			}, nil
+		found, count, err := r.memory.HasRelevant(graphNodeIDs, developerID)
+		if err == nil && found {
+			rec.MemoryAvailable = true
+			rec.MemoryCount = count
 		}
 	}
 
-	// 3. COMPLEXITY CHECK
-	nodeCount := len(task.GraphNodeIDs)
+	// Graph analysis
+	nodeCount := len(graphNodeIDs)
 	crossRepo := false
-	if r.graph != nil && len(task.GraphNodeIDs) > 0 {
-		if n, err := r.graph.CountAffectedNodes(task.GraphNodeIDs); err == nil {
+	if r.graph != nil && len(graphNodeIDs) > 0 {
+		if n, err := r.graph.CountAffectedNodes(graphNodeIDs); err == nil {
 			nodeCount = n
 		}
-		if cr, err := r.graph.IsCrossRepo(task.GraphNodeIDs); err == nil {
+		if cr, err := r.graph.IsCrossRepo(graphNodeIDs); err == nil {
 			crossRepo = cr
 		}
 	}
+	rec.AffectedNodeCount = nodeCount
+	rec.CrossRepo = crossRepo
 
-	hasTemplate := HasTemplate(task.TaskType)
-	simple := nodeCount <= r.config.SimpleTaskMaxNodes && !crossRepo
-
+	// Risk level
 	switch {
-	case simple && hasTemplate:
-		return &RoutingDecision{
-			Mode:         ModePlanExecute,
-			PlannerRole:  "premium",
-			ExecutorRole: "low_cost",
-			VerifierRole: "automated",
-			NextStep:     "plan",
-			VerifyTier:   VerifyAutomated,
-			TemplateID:   GetTemplateName(task.TaskType),
-			Reason:       "simple task with template",
-		}, nil
-
-	case simple && !hasTemplate && nodeCount <= 2:
-		return &RoutingDecision{
-			Mode:         ModeSingleHaiku,
-			PlannerRole:  "low_cost",
-			ExecutorRole: "low_cost",
-			VerifierRole: "low_cost",
-			NextStep:     "direct",
-			VerifyTier:   VerifySpotCheck,
-			SkipPlanning: true,
-			Reason:       "simple task, no template",
-		}, nil
-
-	case !simple && hasTemplate:
-		return &RoutingDecision{
-			Mode:         ModeFullOrchestration,
-			PlannerRole:  "premium",
-			ExecutorRole: "low_cost",
-			VerifierRole: "premium",
-			NextStep:     "plan",
-			VerifyTier:   VerifyFullReview,
-			TemplateID:   GetTemplateName(task.TaskType),
-			Reason:       "complex task with template",
-		}, nil
-
+	case nodeCount >= 6 && crossRepo:
+		rec.RiskLevel = "high"
+	case nodeCount >= 3 || crossRepo:
+		rec.RiskLevel = "medium"
 	default:
-		return &RoutingDecision{
-			Mode:         ModeSingleOpus,
-			PlannerRole:  "premium",
-			ExecutorRole: "premium",
-			VerifierRole: "premium",
-			NextStep:     "direct",
-			VerifyTier:   VerifyFullReview,
-			SkipPlanning: true,
-			Reason:       "complex task, no template",
-		}, nil
+		rec.RiskLevel = "low"
 	}
+
+	// Build recommendation text
+	var parts []string
+	if rec.SkillAvailable {
+		parts = append(parts, fmt.Sprintf("Skill '%s' available (%.0f%% confidence). Verify before using.",
+			rec.SkillName, rec.SkillConfidence*100))
+	}
+	if rec.MemoryAvailable {
+		parts = append(parts, fmt.Sprintf("%d past observations found. Check recall_memory.", rec.MemoryCount))
+	}
+	switch rec.RiskLevel {
+	case "high":
+		parts = append(parts, fmt.Sprintf("Cross-repo change, %d nodes affected. Plan carefully, high risk.", nodeCount))
+	case "medium":
+		if crossRepo {
+			parts = append(parts, fmt.Sprintf("Cross-repo change affecting %d nodes. Medium risk.", nodeCount))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d nodes affected. Medium risk.", nodeCount))
+		}
+	default:
+		parts = append(parts, "Simple change. Low risk.")
+	}
+	rec.Recommendation = strings.Join(parts, " ")
+
+	return rec, nil
 }
 
-// ClassifyTaskType determines the TaskType from the developer's prompt using keyword matching.
-func ClassifyTaskType(prompt string) TaskType {
+// ClassifyTaskType determines what type of task this is based on keywords.
+// Used for dashboard categorization, not routing decisions.
+func ClassifyTaskType(prompt string) string {
 	lower := strings.ToLower(prompt)
-
 	has := func(words ...string) bool {
 		for _, w := range words {
 			if strings.Contains(lower, w) {
@@ -167,33 +129,20 @@ func ClassifyTaskType(prompt string) TaskType {
 		}
 		return false
 	}
-
 	switch {
-	// explanation must come before analysis ("why"/"how does" appear in analysis prompts too)
-	case has("explain", "why", "how does", "what is", "understand"):
-		return TaskExplanation
-	case has("fix", "bug", "mismatch", "broken", "panic", "crash"):
-		return TaskCodeFix
+	case has("fix", "bug", "broken", "crash", "panic"):
+		return "code_fix"
 	case has("test", "cover", "assert", "spec"):
-		return TaskTestGen
-	case has("pr", "pull request", "review"):
-		return TaskPRGen
+		return "test_gen"
 	case has("refactor", "rename", "extract", "restructure"):
-		return TaskRefactor
+		return "refactor"
 	case has("migrate", "migration", "schema"):
-		return TaskMigration
-	// config before update/upgrade so "update the config" → config_change, not dep_update
-	case has("config", "setting", "env var", ".env", "yaml", "toml"):
-		return TaskConfigChange
-	case has("update", "upgrade", "dependency", "dependencies", "version", "bump"):
-		return TaskDepUpdate
-	case has("analyze", "analysis", "impact", "affect"):
-		return TaskAnalysis
+		return "migration"
+	case has("pr", "pull request"):
+		return "pr_gen"
+	case has("explain", "why", "how does", "what is"):
+		return "explanation"
 	default:
-		return TaskGeneral
+		return "general"
 	}
-}
-
-func fmtFloat(f float64) string {
-	return fmt.Sprintf("%.2f", f)
 }

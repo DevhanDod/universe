@@ -2,10 +2,8 @@ package mcp
 
 import (
 	"encoding/json"
-	"time"
 
 	"github.com/Universe/universe/internal/orchestrator"
-	"github.com/google/uuid"
 )
 
 // routeTaskInput is the argument schema for universe_route_task.
@@ -19,20 +17,19 @@ type routeTaskInput struct {
 
 // routeTaskOutput is the full response sent back to the agent.
 type routeTaskOutput struct {
-	// Routing decision fields
-	Mode           string `json:"mode"`
-	PlannerRole    string `json:"planner_role"`
-	ExecutorRole   string `json:"executor_role"`
-	VerifierRole   string `json:"verifier_role"`
-	NextStep       string `json:"next_step"`
-	SkipPlanning   bool   `json:"skip_planning"`
-	TemplateID     string `json:"template_id,omitempty"`
-	MatchedSkillID string `json:"matched_skill_id,omitempty"`
-	MemoryHit      bool   `json:"memory_hit"`
-	Reason         string `json:"reason"`
-	// Task classification
-	TaskType string `json:"task_type"`
-	// Model hints from user config — agent maps these to its models
+	// Routing recommendation fields
+	SkillAvailable    bool    `json:"skill_available"`
+	SkillID           string  `json:"skill_id,omitempty"`
+	SkillName         string  `json:"skill_name,omitempty"`
+	SkillConfidence   float64 `json:"skill_confidence,omitempty"`
+	MemoryAvailable   bool    `json:"memory_available"`
+	MemoryCount       int     `json:"memory_count,omitempty"`
+	AffectedNodeCount int     `json:"affected_node_count"`
+	CrossRepo         bool    `json:"cross_repo"`
+	RiskLevel         string  `json:"risk_level"`
+	Recommendation    string  `json:"recommendation"`
+	// Task classification and model hints
+	TaskType     string `json:"task_type"`
 	PremiumModel string `json:"premium_model"`
 	LowCostModel string `json:"low_cost_model"`
 }
@@ -41,9 +38,10 @@ type routeTaskOutput struct {
 func RegisterRouteTask(reg *Registry, router *orchestrator.Router, cfg *orchestrator.UserConfig) {
 	reg.Register(ToolDef{
 		Name: "universe_route_task",
-		Description: "Analyse a developer task and return a routing decision. " +
-			"Returns which model role to use for planning, execution, and verification, " +
-			"plus the task type and model name hints. Zero LLM tokens — pure logic.",
+		Description: "Analyse a developer task and return routing recommendations. " +
+			"Returns whether a skill or past memory is available, the blast radius, " +
+			"risk level, and a plain-English recommendation for the planner. " +
+			"Zero LLM tokens — pure logic.",
 		InputSchema: jsonSchema(map[string]interface{}{
 			"task":           strProp("The developer's request text"),
 			"graph_node_ids": arrStrProp("Graph node IDs of affected symbols (optional — pass [] if unknown)"),
@@ -57,35 +55,30 @@ func RegisterRouteTask(reg *Registry, router *orchestrator.Router, cfg *orchestr
 			return nil, err
 		}
 
-		task := orchestrator.Task{
-			ID:           uuid.NewString(),
-			DeveloperID:  in.DeveloperID,
-			RepoID:       in.RepoID,
-			Prompt:       in.Task,
-			GraphNodeIDs: in.GraphNodeIDs,
-			TaskType:     orchestrator.ClassifyTaskType(in.Task),
-			CreatedAt:    time.Now(),
+		developerID := in.DeveloperID
+		if developerID == "" {
+			developerID = "cursor-agent"
 		}
 
-		decision, err := router.Route(task)
+		rec, err := router.Recommend(in.GraphNodeIDs, in.Task, developerID)
 		if err != nil {
 			return nil, err
 		}
 
 		out := routeTaskOutput{
-			Mode:           string(decision.Mode),
-			PlannerRole:    decision.PlannerRole,
-			ExecutorRole:   decision.ExecutorRole,
-			VerifierRole:   decision.VerifierRole,
-			NextStep:       decision.NextStep,
-			SkipPlanning:   decision.SkipPlanning,
-			TemplateID:     decision.TemplateID,
-			MatchedSkillID: decision.MatchedSkillID,
-			MemoryHit:      decision.MemoryHit,
-			Reason:         decision.Reason,
-			TaskType:       string(task.TaskType),
-			PremiumModel:   cfg.PremiumModel,
-			LowCostModel:   cfg.LowCostModel,
+			SkillAvailable:    rec.SkillAvailable,
+			SkillID:           rec.SkillID,
+			SkillName:         rec.SkillName,
+			SkillConfidence:   rec.SkillConfidence,
+			MemoryAvailable:   rec.MemoryAvailable,
+			MemoryCount:       rec.MemoryCount,
+			AffectedNodeCount: rec.AffectedNodeCount,
+			CrossRepo:         rec.CrossRepo,
+			RiskLevel:         rec.RiskLevel,
+			Recommendation:    rec.Recommendation,
+			TaskType:          orchestrator.ClassifyTaskType(in.Task),
+			PremiumModel:      cfg.PremiumModel,
+			LowCostModel:      cfg.LowCostModel,
 		}
 
 		data, _ := json.MarshalIndent(out, "", "  ")

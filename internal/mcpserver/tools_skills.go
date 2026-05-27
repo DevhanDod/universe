@@ -13,9 +13,9 @@ import (
 // ============================================================
 
 type FindSkillInput struct {
-	TaskText     string   `json:"task_text" jsonschema:"required,description=Description of the task to find a skill for"`
-	GraphNodeIDs []string `json:"graph_node_ids,omitempty" jsonschema:"description=Graph node IDs from current context"`
-	Language     string   `json:"language,omitempty" jsonschema:"description=Programming language of the repo: go python typescript"`
+	TaskText     string   `json:"task_text"`
+	GraphNodeIDs []string `json:"graph_node_ids,omitempty"`
+	Language     string   `json:"language,omitempty"`
 }
 
 type FindSkillOutput struct {
@@ -28,6 +28,13 @@ type FindSkillOutput struct {
 	Confidence         float64 `json:"confidence,omitempty"`
 	ExplorationSkipped bool    `json:"exploration_skipped"`
 	Message            string  `json:"message"`
+
+	// Verification fields — always set when Found=true.
+	RequiresVerification bool   `json:"requires_verification"`
+	VerificationPrompt   string `json:"verification_prompt,omitempty"`
+	StaleWarning         bool   `json:"stale_warning"`
+	LastUpdated          string `json:"last_updated,omitempty"`
+	TimesApplied         int    `json:"times_applied,omitempty"`
 }
 
 func (h *Handlers) HandleFindSkill(
@@ -72,15 +79,31 @@ func (h *Handlers) HandleFindSkill(
 		return nil, FindSkillOutput{}, err
 	}
 
+	isStale := false
+	for _, tag := range skill.NegativeTags {
+		if tag.Context == "graph_changed" {
+			isStale = true
+			break
+		}
+	}
+
 	return nil, FindSkillOutput{
-		Found:       true,
-		SkillID:     skill.ID,
-		SkillName:   skill.Name,
-		Version:     skill.Version,
-		Instruction: skill.Instruction,
-		SuccessRate: result.BestMatch.SuccessRate,
-		Confidence:  result.BestMatch.Confidence,
-		Message:     "Skill found. Follow the instruction below for this task.",
+		Found:                true,
+		SkillID:              skill.ID,
+		SkillName:            skill.Name,
+		Version:              skill.Version,
+		Instruction:          skill.Instruction,
+		SuccessRate:          result.BestMatch.SuccessRate,
+		Confidence:           result.BestMatch.Confidence,
+		TimesApplied:         skill.TimesApplied,
+		LastUpdated:          skill.CreatedAt.Format("2006-01-02"),
+		RequiresVerification: true,
+		VerificationPrompt:   result.BestMatch.VerificationPrompt,
+		StaleWarning:         isStale,
+		Message: "Skill found. IMPORTANT: You are the planning agent (premium model). " +
+			"Review the skill instruction against the current code before including it in your plan. " +
+			"If the skill is correct, include its steps in the plan for the execution agent. " +
+			"If it is outdated, plan from scratch using the graph context instead.",
 	}, nil
 }
 
@@ -89,10 +112,10 @@ func (h *Handlers) HandleFindSkill(
 // ============================================================
 
 type ReportSkillExecutionInput struct {
-	SkillID     string `json:"skill_id" jsonschema:"required,description=The skill ID that was applied"`
-	Success     bool   `json:"success" jsonschema:"required,description=Whether the skill application succeeded"`
-	ErrorDetail string `json:"error_detail,omitempty" jsonschema:"description=Error message if the skill failed"`
-	TokensUsed  int    `json:"tokens_used,omitempty" jsonschema:"description=Tokens consumed during execution"`
+	SkillID     string `json:"skill_id"`
+	Success     bool   `json:"success"`
+	ErrorDetail string `json:"error_detail,omitempty"`
+	TokensUsed  int    `json:"tokens_used,omitempty"`
 }
 
 type ReportSkillExecutionOutput struct {
@@ -134,9 +157,9 @@ func (h *Handlers) HandleReportSkillExecution(
 // ============================================================
 
 type ListSkillsInput struct {
-	GraphNodeID string `json:"graph_node_id,omitempty" jsonschema:"description=Filter by skills covering this graph node"`
-	Language    string `json:"language,omitempty" jsonschema:"description=Filter by language"`
-	Limit       int    `json:"limit,omitempty" jsonschema:"description=Max results (default 20)"`
+	GraphNodeID string `json:"graph_node_id,omitempty"`
+	Language    string `json:"language,omitempty"`
+	Limit       int    `json:"limit,omitempty"`
 }
 
 type ListSkillsOutput struct {
@@ -212,7 +235,7 @@ func (h *Handlers) HandleListSkills(
 // ============================================================
 
 type GetSkillLineageInput struct {
-	SkillID string `json:"skill_id" jsonschema:"required,description=Any version ID — the full evolution history is returned"`
+	SkillID string `json:"skill_id"`
 }
 
 type GetSkillLineageOutput struct {

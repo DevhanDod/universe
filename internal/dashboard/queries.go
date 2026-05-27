@@ -17,24 +17,23 @@ func QueryMonthlySummary(db *pgxpool.Pool) (MonthlySummary, error) {
 	if db == nil {
 		return s, nil
 	}
-	// Current month totals from agent_costs directly (materialized view may be stale)
+	// Current month totals from plan_costs (materialized view may be stale)
 	row := db.QueryRow(context.Background(), `
 		SELECT
-			COALESCE(COUNT(DISTINCT task_id), 0)                                                  AS total_tasks,
-			COALESCE(SUM(cost_usd), 0)                                                            AS actual_cost,
-			COALESCE(SUM((input_tokens * 15.0 / 1000000) + (output_tokens * 75.0 / 1000000)), 0) AS would_have,
-			COALESCE(COUNT(*) FILTER (WHERE skill_id IS NOT NULL), 0)                             AS skill_uses,
+			COALESCE(COUNT(*), 0)                                                                  AS total_tasks,
+			COALESCE(SUM(estimated_total_cost), 0)                                                AS actual_cost,
+			COALESCE(SUM(estimated_all_premium_cost), 0)                                          AS would_have,
+			COALESCE(COUNT(*) FILTER (WHERE skill_used), 0)                                       AS skill_uses,
 			COALESCE(COUNT(*) FILTER (WHERE memory_hit), 0)                                       AS memory_hits,
-			COALESCE(COUNT(*) FILTER (WHERE was_takeover), 0)                                     AS takeovers,
 			COALESCE(
-				COUNT(*) FILTER (WHERE model = 'haiku')::float /
+				COUNT(*) FILTER (WHERE executor_model ILIKE '%haiku%')::float /
 				GREATEST(COUNT(*), 1) * 100, 0)                                                   AS haiku_pct
-		FROM agent_costs
+		FROM plan_costs
 		WHERE created_at >= date_trunc('month', NOW())
 	`)
 	var wouldHave float64
 	if err := row.Scan(&s.TotalTasks, &s.ActualCost, &wouldHave,
-		&s.SkillUses, &s.MemoryHits, &s.Takeovers, &s.HaikuPct); err != nil {
+		&s.SkillUses, &s.MemoryHits, &s.HaikuPct); err != nil {
 		return s, fmt.Errorf("query monthly summary: %w", err)
 	}
 	s.WouldHaveCost = wouldHave
@@ -42,6 +41,7 @@ func QueryMonthlySummary(db *pgxpool.Pool) (MonthlySummary, error) {
 	if wouldHave > 0 {
 		s.SavingsPct = s.SavingsUSD / wouldHave * 100
 	}
+	s.Takeovers = 0 // concept removed in plan-based architecture
 	return s, nil
 }
 
@@ -52,12 +52,9 @@ func QueryMonthlyTrend(db *pgxpool.Pool) ([]MonthlyDataPoint, error) {
 	rows, err := db.Query(context.Background(), `
 		SELECT
 			to_char(date_trunc('month', created_at), 'Mon') AS month,
-			COALESCE(SUM(cost_usd), 0)                      AS actual,
-			COALESCE(SUM(
-				(input_tokens * 15.0 / 1000000) +
-				(output_tokens * 75.0 / 1000000)
-			), 0)                                           AS would_have
-		FROM agent_costs
+			COALESCE(SUM(estimated_total_cost), 0)          AS actual,
+			COALESCE(SUM(estimated_all_premium_cost), 0)    AS would_have
+		FROM plan_costs
 		WHERE created_at >= NOW() - INTERVAL '6 months'
 		GROUP BY date_trunc('month', created_at)
 		ORDER BY date_trunc('month', created_at)
@@ -135,16 +132,16 @@ func QueryEngineStats(db *pgxpool.Pool, g *graph.Graph) ([]EngineStatus, error) 
 	`).Scan(&samplesCount, &avgReduction)
 	engines[3].Detail = fmt.Sprintf("compact mode, %.0f%% reduction", avgReduction)
 
-	// Engine 5 — routing stats
-	var taskCount int
+	// Engine 5 — plan bridge stats
+	var planCount int
 	var haikuPct, costToday float64
 	db.QueryRow(context.Background(), `
-		SELECT COUNT(DISTINCT task_id),
-			COALESCE(COUNT(*) FILTER (WHERE model='haiku')::float / GREATEST(COUNT(*), 1) * 100, 0),
-			COALESCE(SUM(cost_usd), 0)
-		FROM agent_costs WHERE created_at >= CURRENT_DATE
-	`).Scan(&taskCount, &haikuPct, &costToday)
-	engines[4].Detail = fmt.Sprintf("%.0f%% low-cost, $%.2f today", haikuPct, costToday)
+		SELECT COUNT(*),
+			COALESCE(COUNT(*) FILTER (WHERE executor_model ILIKE '%haiku%')::float / GREATEST(COUNT(*), 1) * 100, 0),
+			COALESCE(SUM(estimated_total_cost), 0)
+		FROM plan_costs WHERE created_at >= CURRENT_DATE
+	`).Scan(&planCount, &haikuPct, &costToday)
+	engines[4].Detail = fmt.Sprintf("%d plans today, $%.2f estimated, %.0f%% low-cost", planCount, costToday, haikuPct)
 
 	return engines, nil
 }
@@ -510,26 +507,26 @@ func QueryRoutingTasks(db *pgxpool.Pool, f RoutingFilters) (*RoutingListResponse
 		return &RoutingListResponse{Tasks: []RoutingTaskRow{}, Stats: RoutingStats{ByRoutingMode: map[string]int{}}}, nil
 	}
 
+	// Join plans with plan_costs to show cost info alongside plan status
 	rows, err := db.Query(context.Background(), `
 		SELECT
-			task_id,
-			COALESCE(MIN(developer_id), ''),
-			COALESCE(MIN(task_prompt_preview), ''),
-			COALESCE(MIN(routing_mode), ''),
-			COALESCE(SUM(input_tokens + output_tokens), 0)          AS total_tokens,
-			COALESCE(SUM(cost_usd), 0)                              AS total_cost,
-			COALESCE(SUM((input_tokens*15.0/1000000)+(output_tokens*75.0/1000000)), 0) AS would_have,
-			COALESCE(SUM(latency_ms), 0)                            AS total_latency,
-			COALESCE(MAX(escalation_steps), 0)                      AS esc_steps,
-			BOOL_OR(was_takeover)                                   AS takeover,
-			BOOL_OR(memory_hit)                                     AS mem_hit,
-			MIN(created_at)                                         AS first_at
-		FROM agent_costs
-		WHERE ($1 = '' OR developer_id = $1)
-		  AND ($2 = '' OR routing_mode = $2)
-		  AND created_at >= $3 AND created_at <= $4
-		GROUP BY task_id
-		ORDER BY MIN(created_at) DESC
+			p.id                                                 AS task_id,
+			COALESCE(p.developer_id, '')                        AS developer_id,
+			COALESCE(p.title, '')                               AS prompt_preview,
+			p.status                                            AS routing_mode,
+			COALESCE(pc.estimated_total_cost, 0)               AS total_cost,
+			COALESCE(pc.estimated_all_premium_cost, 0)         AS would_have_cost,
+			COALESCE(pc.memory_hit, false)                     AS memory_hit,
+			p.created_at
+		FROM plans p
+		LEFT JOIN LATERAL (
+			SELECT estimated_total_cost, estimated_all_premium_cost, memory_hit
+			FROM plan_costs WHERE plan_id = p.id ORDER BY created_at DESC LIMIT 1
+		) pc ON true
+		WHERE ($1 = '' OR p.developer_id = $1)
+		  AND ($2 = '' OR p.status = $2)
+		  AND p.created_at >= $3 AND p.created_at <= $4
+		ORDER BY p.created_at DESC
 		LIMIT $5 OFFSET $6`,
 		f.DeveloperID, f.RoutingMode, from, to, f.Limit, offset)
 	if err != nil {
@@ -541,10 +538,15 @@ func QueryRoutingTasks(db *pgxpool.Pool, f RoutingFilters) (*RoutingListResponse
 	for rows.Next() {
 		var t RoutingTaskRow
 		if err := rows.Scan(&t.TaskID, &t.DeveloperID, &t.PromptPreview,
-			&t.RoutingMode, &t.TotalTokens, &t.TotalCost, &t.WouldHaveCost,
-			&t.LatencyMS, &t.EscalationSteps, &t.WasTakeover, &t.MemoryHit, &t.CreatedAt); err != nil {
+			&t.RoutingMode, &t.TotalCost, &t.WouldHaveCost,
+			&t.MemoryHit, &t.CreatedAt); err != nil {
 			return nil, err
 		}
+		// Fields not tracked in plan-based architecture
+		t.TotalTokens = 0
+		t.LatencyMS = 0
+		t.EscalationSteps = 0
+		t.WasTakeover = false
 		tasks = append(tasks, t)
 	}
 	if err := rows.Err(); err != nil {
@@ -553,9 +555,9 @@ func QueryRoutingTasks(db *pgxpool.Pool, f RoutingFilters) (*RoutingListResponse
 
 	var total int
 	db.QueryRow(context.Background(), `
-		SELECT COUNT(DISTINCT task_id) FROM agent_costs
+		SELECT COUNT(*) FROM plans
 		WHERE ($1 = '' OR developer_id = $1)
-		  AND ($2 = '' OR routing_mode = $2)
+		  AND ($2 = '' OR status = $2)
 		  AND created_at >= $3 AND created_at <= $4`,
 		f.DeveloperID, f.RoutingMode, from, to).Scan(&total)
 
@@ -573,75 +575,45 @@ func QueryRoutingTasks(db *pgxpool.Pool, f RoutingFilters) (*RoutingListResponse
 }
 
 func QueryRoutingDetail(db *pgxpool.Pool, taskID string) (*RoutingDetail, error) {
-	rows, err := db.Query(context.Background(), `
-		SELECT phase, model, input_tokens + output_tokens,
-		       COALESCE(latency_ms, 0), cost_usd,
-		       COALESCE(task_prompt_preview, ''), routing_mode, memory_hit,
-		       escalation_steps, was_takeover, created_at
-		FROM agent_costs WHERE task_id = $1
-		ORDER BY created_at ASC`, taskID)
-	if err != nil {
-		return nil, fmt.Errorf("query routing detail: %w", err)
+	if db == nil {
+		return &RoutingDetail{TaskID: taskID, Trace: []RoutingTraceStep{}}, nil
 	}
-	defer rows.Close()
 
 	var detail RoutingDetail
 	detail.TaskID = taskID
-	step := 0
-	var totalCost, wouldHave float64
-	var totalTokens, totalLatency int
 
-	for rows.Next() {
-		step++
-		var phase, model, prompt, routingMode string
-		var tokens, latency int
-		var cost float64
-		var memHit, takeover bool
-		var escSteps int
-		var createdAt time.Time
-		if err := rows.Scan(&phase, &model, &tokens, &latency, &cost,
-			&prompt, &routingMode, &memHit, &escSteps, &takeover, &createdAt); err != nil {
-			return nil, err
-		}
-		if detail.DeveloperID == "" {
-			// developer_id not stored per-row in this query — pull separately
-		}
-		if detail.Prompt == "" && prompt != "" {
-			detail.Prompt = prompt
-		}
-		if detail.RoutingMode == "" {
-			detail.RoutingMode = routingMode
-		}
-		if detail.CreatedAt.IsZero() {
-			detail.CreatedAt = createdAt
-		}
-		totalCost += cost
-		totalTokens += tokens
-		totalLatency += latency
-		wouldHave += float64(tokens) * 15.0 / 1000000 // rough approximation
-
-		detail.Trace = append(detail.Trace, RoutingTraceStep{
-			Step:       step,
-			Action:     phase,
-			Detail:     fmt.Sprintf("%s phase", phase),
-			Tokens:     tokens,
-			Model:      model,
-			DurationMS: latency,
-		})
+	// Load plan details
+	var steps []byte
+	var status string
+	err := db.QueryRow(context.Background(), `
+		SELECT developer_id, task_prompt, status, steps,
+		       COALESCE(planner_model, ''), COALESCE(executor_model, ''),
+		       created_at
+		FROM plans WHERE id = $1`, taskID).
+		Scan(&detail.DeveloperID, &detail.Prompt, &status, &steps,
+			&detail.RoutingMode, new(string), &detail.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("query plan detail: %w", err)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	detail.RoutingMode = status
+
+	// Build trace from plan steps
+	var planSteps []string
+	if err := json.Unmarshal(steps, &planSteps); err == nil {
+		for i, step := range planSteps {
+			detail.Trace = append(detail.Trace, RoutingTraceStep{
+				Step:   i + 1,
+				Action: "plan_step",
+				Detail: step,
+			})
+		}
 	}
 
-	// Fetch developer_id separately
-	db.QueryRow(context.Background(),
-		`SELECT COALESCE(MIN(developer_id), '') FROM agent_costs WHERE task_id = $1`, taskID).
-		Scan(&detail.DeveloperID)
-
-	detail.TotalCost = totalCost
-	detail.WouldHaveCost = wouldHave
-	detail.TotalTokens = totalTokens
-	detail.TotalLatencyMS = totalLatency
+	// Load cost info
+	db.QueryRow(context.Background(), `
+		SELECT COALESCE(estimated_total_cost, 0), COALESCE(estimated_all_premium_cost, 0)
+		FROM plan_costs WHERE plan_id = $1 ORDER BY created_at DESC LIMIT 1`, taskID).
+		Scan(&detail.TotalCost, &detail.WouldHaveCost)
 
 	if detail.Trace == nil {
 		detail.Trace = []RoutingTraceStep{}
@@ -658,23 +630,21 @@ func QueryRoutingStats(db *pgxpool.Pool) (RoutingStats, error) {
 
 	db.QueryRow(context.Background(), `
 		SELECT
-			COALESCE(COUNT(DISTINCT task_id), 0),
-			COALESCE(COUNT(*) FILTER (WHERE model='haiku')::float / GREATEST(COUNT(*), 1) * 100, 0),
-			COALESCE(SUM(cost_usd), 0),
-			COALESCE(COUNT(*) FILTER (WHERE was_takeover), 0)
-		FROM agent_costs WHERE created_at >= CURRENT_DATE`).
-		Scan(&s.TasksToday, &s.HaikuPct, &s.CostToday, &s.TakeoversToday)
+			COALESCE(COUNT(*), 0),
+			COALESCE(COUNT(*) FILTER (WHERE executor_model ILIKE '%haiku%')::float / GREATEST(COUNT(*), 1) * 100, 0),
+			COALESCE(SUM(estimated_total_cost), 0)
+		FROM plan_costs WHERE created_at >= CURRENT_DATE`).
+		Scan(&s.TasksToday, &s.HaikuPct, &s.CostToday)
 
-	modeRows, err := db.Query(context.Background(), `
-		SELECT routing_mode, COUNT(DISTINCT task_id)
-		FROM agent_costs WHERE created_at >= CURRENT_DATE
-		GROUP BY routing_mode`)
+	// ByRoutingMode maps to plan status counts
+	statusRows, err := db.Query(context.Background(), `
+		SELECT status, COUNT(*) FROM plans WHERE created_at >= CURRENT_DATE GROUP BY status`)
 	if err == nil {
-		defer modeRows.Close()
-		for modeRows.Next() {
+		defer statusRows.Close()
+		for statusRows.Next() {
 			var mode string
 			var cnt int
-			if err := modeRows.Scan(&mode, &cnt); err == nil {
+			if err := statusRows.Scan(&mode, &cnt); err == nil {
 				s.ByRoutingMode[mode] = cnt
 			}
 		}
@@ -826,4 +796,180 @@ func QueryGraphNodeDetail(db *pgxpool.Pool, g *graph.Graph, nodeID string) (*Gra
 		detail.RecentRoutes = []RoutingTaskRow{}
 	}
 	return &detail, nil
+}
+
+
+// ── Plans ─────────────────────────────────────────────────────────────────────
+
+func QueryPlansList(db *pgxpool.Pool, f PlanFilters) (*PlanListResponse, error) {
+	if db == nil {
+		return &PlanListResponse{Plans: []PlanRow{}, Stats: PlanStatsResponse{}}, nil
+	}
+	if f.Page <= 0 {
+		f.Page = 1
+	}
+	if f.Limit <= 0 {
+		f.Limit = 20
+	}
+	offset := (f.Page - 1) * f.Limit
+
+	args := []interface{}{}
+	where := "WHERE 1=1"
+	if f.DeveloperID != "" {
+		args = append(args, f.DeveloperID)
+		where += fmt.Sprintf(" AND developer_id = $%d", len(args))
+	}
+	if f.Status != "" {
+		args = append(args, f.Status)
+		where += fmt.Sprintf(" AND status = $%d", len(args))
+	}
+
+	args = append(args, f.Limit, offset)
+	limitArg := len(args) - 1
+	offsetArg := len(args)
+
+	rows, err := db.Query(context.Background(), fmt.Sprintf(`
+		SELECT id, developer_id, title, status,
+		       jsonb_array_length(steps),
+		       skill_used IS NOT NULL, skill_verified, cross_repo,
+		       COALESCE(risk_level,''), COALESCE(planner_model,''), COALESCE(executor_model,''),
+		       result_success, result_tests, created_at, executed_at, verified_at
+		FROM plans %s
+		ORDER BY created_at DESC
+		LIMIT $%d OFFSET $%d`, where, limitArg, offsetArg), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var plans []PlanRow
+	for rows.Next() {
+		var p PlanRow
+		if err := rows.Scan(
+			&p.ID, &p.DeveloperID, &p.Title, &p.Status,
+			&p.StepCount, &p.SkillUsed, &p.SkillVerified, &p.CrossRepo,
+			&p.RiskLevel, &p.PlannerModel, &p.ExecutorModel,
+			&p.ResultSuccess, &p.ResultTests,
+			&p.CreatedAt, &p.ExecutedAt, &p.VerifiedAt,
+		); err != nil {
+			return nil, err
+		}
+		plans = append(plans, p)
+	}
+	if plans == nil {
+		plans = []PlanRow{}
+	}
+
+	var total int
+	countArgs := args[:len(args)-2]
+	db.QueryRow(context.Background(),
+		fmt.Sprintf("SELECT COUNT(*) FROM plans %s", where), countArgs...).Scan(&total)
+
+	stats, _ := QueryPlanStats(db, f.DeveloperID)
+	if stats == nil {
+		stats = &PlanStatsResponse{}
+	}
+
+	return &PlanListResponse{
+		Plans: plans, Total: total, Page: f.Page, Limit: f.Limit, Stats: *stats,
+	}, nil
+}
+
+func QueryPlanDetail(db *pgxpool.Pool, id string) (*PlanDetail, error) {
+	if db == nil {
+		return nil, fmt.Errorf("no database")
+	}
+
+	var d PlanDetail
+	var stepsJSON []byte
+	var filesToChangeJSON []byte
+	var affectedNodesJSON []byte
+	var status string
+
+	err := db.QueryRow(context.Background(), `
+		SELECT p.id, p.developer_id, p.title, p.status,
+		       jsonb_array_length(p.steps),
+		       p.skill_used IS NOT NULL, p.skill_verified, p.cross_repo,
+		       COALESCE(p.risk_level,''), COALESCE(p.planner_model,''), COALESCE(p.executor_model,''),
+		       p.result_success, p.result_tests, p.created_at, p.executed_at, p.verified_at,
+		       p.task_prompt, p.steps,
+		       to_json(COALESCE(p.files_to_change, ARRAY[]::TEXT[])),
+		       COALESCE(p.graph_context,''),
+		       to_json(COALESCE(p.affected_nodes, ARRAY[]::TEXT[])),
+		       COALESCE(p.result_summary,''),
+		       to_json(COALESCE(p.result_files, ARRAY[]::TEXT[])),
+		       COALESCE(p.result_error,''), COALESCE(p.verification_note,''),
+		       COALESCE(pc.estimated_total_cost, 0),
+		       COALESCE(pc.estimated_all_premium_cost, 0),
+		       COALESCE(pc.estimated_savings, 0)
+		FROM plans p
+		LEFT JOIN plan_costs pc ON pc.plan_id = p.id
+		WHERE p.id = $1
+		LIMIT 1`, id).Scan(
+		&d.ID, &d.DeveloperID, &d.Title, &status,
+		&d.StepCount, &d.SkillUsed, &d.SkillVerified, &d.CrossRepo,
+		&d.RiskLevel, &d.PlannerModel, &d.ExecutorModel,
+		&d.ResultSuccess, &d.ResultTests, &d.CreatedAt, &d.ExecutedAt, &d.VerifiedAt,
+		&d.TaskPrompt, &stepsJSON, &filesToChangeJSON,
+		&d.GraphContext, &affectedNodesJSON,
+		&d.ResultSummary, &filesToChangeJSON, // reuse for result files below
+		&d.ResultError, &d.VerificationNote,
+		&d.EstimatedCost, &d.AllPremiumCost, &d.EstimatedSavings,
+	)
+	if err != nil {
+		return nil, err
+	}
+	d.Status = status
+	json.Unmarshal(stepsJSON, &d.Steps)
+	json.Unmarshal(filesToChangeJSON, &d.FilesToChange)
+	json.Unmarshal(affectedNodesJSON, &d.AffectedNodes)
+	if d.Steps == nil {
+		d.Steps = []string{}
+	}
+	if d.FilesToChange == nil {
+		d.FilesToChange = []string{}
+	}
+	if d.AffectedNodes == nil {
+		d.AffectedNodes = []string{}
+	}
+	return &d, nil
+}
+
+func QueryPlanStats(db *pgxpool.Pool, developerID string) (*PlanStatsResponse, error) {
+	if db == nil {
+		return &PlanStatsResponse{}, nil
+	}
+
+	where := "WHERE 1=1"
+	args := []interface{}{}
+	if developerID != "" {
+		args = append(args, developerID)
+		where = "WHERE developer_id = $1"
+	}
+
+	var s PlanStatsResponse
+	err := db.QueryRow(context.Background(), fmt.Sprintf(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'completed'),
+			COUNT(*) FILTER (WHERE status = 'failed'),
+			COUNT(*) FILTER (WHERE status = 'verified'),
+			COUNT(*) FILTER (WHERE status = 'rejected'),
+			COUNT(*) FILTER (WHERE status IN ('pending','executing')),
+			COALESCE(AVG(jsonb_array_length(steps)), 0),
+			COUNT(*) FILTER (WHERE skill_used IS NOT NULL),
+			COUNT(*) FILTER (WHERE cross_repo)
+		FROM plans %s`, where), args...).
+		Scan(&s.TotalPlans, &s.Completed, &s.Failed, &s.Verified, &s.Rejected, &s.Pending,
+			&s.AvgStepsPerPlan, &s.SkillUsedCount, &s.CrossRepoCount)
+	if err != nil {
+		return nil, err
+	}
+
+	denom := s.TotalPlans
+	if denom > 0 {
+		s.CompletionRate = float64(s.Completed+s.Verified) / float64(denom) * 100
+		s.VerificationRate = float64(s.Verified) / float64(denom) * 100
+	}
+	return &s, nil
 }

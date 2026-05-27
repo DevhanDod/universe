@@ -15,16 +15,27 @@ import (
 
 // ServerConfig holds all engine dependencies the MCP server needs.
 type ServerConfig struct {
-	Version      string
-	DatabaseURL  string
-	Graph        *graph.Graph
-	MemoryStore  *memory.Store
-	Retriever    *memory.Retriever
-	SessionMgr   *memory.SessionManager
+	Version     string
+	DatabaseURL string
+
+	// Engine 1: Knowledge Graph
+	Graph *graph.Graph
+
+	// Engine 2: Personal Memory
+	MemoryStore *memory.Store
+	Retriever   *memory.Retriever
+	SessionMgr  *memory.SessionManager
+
+	// Engine 3: Skills
 	SkillStore   *skills.Store
 	SkillMatcher *skills.Matcher
 	SkillExec    *skills.Executor
-	Orchestrator *orchestrator.Orchestrator
+
+	// Engine 5: Plan Bridge + Cost Tracking
+	PlanStore          *orchestrator.PlanStore // plan bridge
+	Router             *orchestrator.Router    // recommendation engine
+	Tracker            *orchestrator.Tracker   // cost tracking
+	OrchestratorConfig *orchestrator.Config    // workspace paths and model config
 }
 
 // RunStdio starts the MCP server over stdin/stdout and blocks until
@@ -43,7 +54,10 @@ func RunStdio(ctx context.Context, config ServerConfig) error {
 		skillStore:   config.SkillStore,
 		skillMatcher: config.SkillMatcher,
 		skillExec:    config.SkillExec,
-		orchestrator: config.Orchestrator,
+		planStore:    config.PlanStore,
+		router:       config.Router,
+		tracker:      config.Tracker,
+		orchConfig:   config.OrchestratorConfig,
 	}
 
 	// Engine 1 — Knowledge Graph
@@ -65,7 +79,7 @@ func RunStdio(ctx context.Context, config ServerConfig) error {
 	// Engine 2 — Persistent Memory
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "recall_memory",
-		Description: "Search past observations from the memory store. Returns compact summaries. Use get_observation_details to load full details for specific IDs.",
+		Description: "Search YOUR past observations from previous sessions. Returns compact summaries. Use get_observation_details to load full details for specific IDs. This is your personal memory — only your own past sessions are searched.",
 	}, h.HandleRecallMemory)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -75,13 +89,13 @@ func RunStdio(ctx context.Context, config ServerConfig) error {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "store_observation",
-		Description: "Store an observation — a pattern, decision, fix, or convention that should be remembered across sessions.",
+		Description: "Store an observation from your current session — a pattern, decision, fix, or convention. Saves to YOUR personal memory and will be recalled in your future sessions when you work on the same code.",
 	}, h.HandleStoreObservation)
 
 	// Engine 3 — Self-Evolving Skills
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "find_skill",
-		Description: "Search for a matching skill recipe for the current task. If found, follow the skill instruction instead of reasoning from scratch — saves tokens and time.",
+		Description: "Search for a matching skill recipe. If found, the PLANNING agent (premium model) must verify the skill is still correct before the EXECUTION agent (low-cost model) uses it. Skills are reference knowledge, not auto-applied recipes.",
 	}, h.HandleFindSkill)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -98,6 +112,32 @@ func RunStdio(ctx context.Context, config ServerConfig) error {
 		Name:        "get_skill_lineage",
 		Description: "Get the full evolution history of a skill — all versions from first capture to current.",
 	}, h.HandleGetSkillLineage)
+
+	// Engine 5 — Plan bridge
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "store_plan",
+		Description: "Store a step-by-step plan created by the PLANNING agent. The executor agent will retrieve it with get_plan. Called after analyzing the task, checking skills, and recalling memory.",
+	}, h.HandleStorePlan)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_plan",
+		Description: "Retrieve the latest pending plan for execution. Called by the EXECUTION agent. Automatically marks the plan as executing. Pass plan_id to retrieve a specific plan.",
+	}, h.HandleGetPlan)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "store_plan_result",
+		Description: "Store the result of executing a plan. Called by the EXECUTION agent after completing all plan steps. Marks the plan as completed or failed.",
+	}, h.HandleStorePlanResult)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_plan_result",
+		Description: "Retrieve the executor's result for a plan. Called by the PLANNING agent to verify the work. Returns the result summary, files changed, and test status.",
+	}, h.HandleGetPlanResult)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "verify_plan",
+		Description: "Approve or reject the executor's result. Called by the PLANNING agent after reviewing the work. Marks the plan as verified or rejected.",
+	}, h.HandleVerifyPlan)
 
 	// Engine 5 — Cost tracking
 	mcp.AddTool(server, &mcp.Tool{
@@ -118,5 +158,8 @@ type Handlers struct {
 	skillStore   *skills.Store
 	skillMatcher *skills.Matcher
 	skillExec    *skills.Executor
-	orchestrator *orchestrator.Orchestrator
+	planStore    *orchestrator.PlanStore
+	router       *orchestrator.Router
+	tracker      *orchestrator.Tracker
+	orchConfig   *orchestrator.Config
 }

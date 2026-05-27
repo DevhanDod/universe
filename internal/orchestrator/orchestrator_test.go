@@ -1,619 +1,560 @@
 package orchestrator
 
 import (
-	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
 // ============================================================
-// MOCK IMPLEMENTATIONS
+// PLAN STORE TESTS (require DATABASE_URL)
 // ============================================================
 
-type mockSkillMatcher struct {
-	match       *SkillMatch
-	err         error
+func testDB(t *testing.T) string {
+	t.Helper()
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL not set — skipping database test")
+	}
+	return dbURL
 }
 
-func (m *mockSkillMatcher) Match(_ []string, _ string) (*SkillMatch, error) {
-	return m.match, m.err
-}
+func TestPlanStore_StoreAndGet(t *testing.T) {
+	dbURL := testDB(t)
+	ps, err := NewPlanStore(dbURL)
+	if err != nil {
+		t.Fatalf("NewPlanStore: %v", err)
+	}
+	defer ps.Close() //nolint:errcheck
 
-type mockMemoryRecaller struct {
-	check *MemoryCheck
-	err   error
-}
+	plan := Plan{
+		DeveloperID: "test-dev",
+		Title:       "Test plan",
+		TaskPrompt:  "Fix the bug in handler",
+		Steps:       []string{"step 1", "step 2", "step 3"},
+		RiskLevel:   "low",
+	}
 
-func (m *mockMemoryRecaller) QuickCheck(_ []string, _ string) (*MemoryCheck, error) {
-	return m.check, m.err
-}
+	stored, err := ps.StorePlan(plan)
+	if err != nil {
+		t.Fatalf("StorePlan: %v", err)
+	}
+	if stored.ID == "" {
+		t.Fatal("expected non-empty ID")
+	}
+	if stored.Status != PlanPending {
+		t.Fatalf("expected pending, got %s", stored.Status)
+	}
 
-type mockGraphAnalyzer struct {
-	nodeCount int
-	crossRepo bool
-	language  string
-}
-
-func (m *mockGraphAnalyzer) CountAffectedNodes(_ []string) (int, error) {
-	return m.nodeCount, nil
-}
-
-func (m *mockGraphAnalyzer) IsCrossRepo(_ []string) (bool, error) {
-	return m.crossRepo, nil
-}
-
-func (m *mockGraphAnalyzer) GetLanguage(_ []string) (string, error) {
-	return m.language, nil
-}
-
-type mockLLMClient struct {
-	responses map[ModelTier]string
-	callCount int
-}
-
-func newMockLLMClient(opusResp, haikuResp string) *mockLLMClient {
-	return &mockLLMClient{
-		responses: map[ModelTier]string{
-			Opus:  opusResp,
-			Haiku: haikuResp,
-		},
+	got, err := ps.GetPlanByID(stored.ID)
+	if err != nil {
+		t.Fatalf("GetPlanByID: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected plan, got nil")
+	}
+	if got.Title != plan.Title {
+		t.Errorf("title: want %q, got %q", plan.Title, got.Title)
+	}
+	if len(got.Steps) != 3 {
+		t.Errorf("steps: want 3, got %d", len(got.Steps))
 	}
 }
 
-func (m *mockLLMClient) callMock(model ModelTier, _, _ string, _ int) (*LLMResponse, error) {
-	m.callCount++
-	resp, ok := m.responses[model]
-	if !ok {
-		return nil, fmt.Errorf("no mock response for model %s", model)
+func TestPlanStore_GetLatest(t *testing.T) {
+	dbURL := testDB(t)
+	ps, err := NewPlanStore(dbURL)
+	if err != nil {
+		t.Fatalf("NewPlanStore: %v", err)
 	}
-	return &LLMResponse{
-		Content:      resp,
-		InputTokens:  100,
-		OutputTokens: 50,
-		Model:        model,
-		LatencyMs:    10,
-		CostUSD:      calculateCost(model, 100, 50),
-	}, nil
+	defer ps.Close() //nolint:errcheck
+
+	devID := "test-dev-latest"
+	plan := Plan{
+		DeveloperID: devID,
+		Title:       "Latest plan",
+		TaskPrompt:  "Do something",
+		Steps:       []string{"step 1"},
+	}
+	stored, err := ps.StorePlan(plan)
+	if err != nil {
+		t.Fatalf("StorePlan: %v", err)
+	}
+
+	got, err := ps.GetLatestPlan(devID)
+	if err != nil {
+		t.Fatalf("GetLatestPlan: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected plan, got nil")
+	}
+	if got.ID != stored.ID {
+		t.Errorf("expected plan %s, got %s", stored.ID, got.ID)
+	}
 }
 
-func defaultConfig() Config {
-	cfg := DefaultConfig()
-	cfg.DatabaseURL = ""
-	return cfg
+func TestPlanStore_GetLatestUpdatesStatus(t *testing.T) {
+	dbURL := testDB(t)
+	ps, err := NewPlanStore(dbURL)
+	if err != nil {
+		t.Fatalf("NewPlanStore: %v", err)
+	}
+	defer ps.Close() //nolint:errcheck
+
+	devID := "test-dev-status"
+	stored, err := ps.StorePlan(Plan{
+		DeveloperID: devID,
+		Title:       "Status test",
+		TaskPrompt:  "test",
+		Steps:       []string{"step 1"},
+	})
+	if err != nil {
+		t.Fatalf("StorePlan: %v", err)
+	}
+
+	got, err := ps.GetLatestPlan(devID)
+	if err != nil {
+		t.Fatalf("GetLatestPlan: %v", err)
+	}
+	if got == nil || got.ID != stored.ID {
+		t.Fatal("plan not found")
+	}
+	if got.Status != PlanExecuting {
+		t.Errorf("expected executing, got %s", got.Status)
+	}
+}
+
+func TestPlanStore_StoreResult(t *testing.T) {
+	dbURL := testDB(t)
+	ps, err := NewPlanStore(dbURL)
+	if err != nil {
+		t.Fatalf("NewPlanStore: %v", err)
+	}
+	defer ps.Close() //nolint:errcheck
+
+	stored, err := ps.StorePlan(Plan{
+		DeveloperID: "test-dev-result",
+		Title:       "Result test",
+		TaskPrompt:  "test",
+		Steps:       []string{"step 1"},
+	})
+	if err != nil {
+		t.Fatalf("StorePlan: %v", err)
+	}
+
+	err = ps.StorePlanResult(stored.ID, true, "all done", []string{"main.go"}, true, "")
+	if err != nil {
+		t.Fatalf("StorePlanResult: %v", err)
+	}
+
+	got, err := ps.GetPlanResult(stored.ID)
+	if err != nil {
+		t.Fatalf("GetPlanResult: %v", err)
+	}
+	if got.Status != PlanCompleted {
+		t.Errorf("expected completed, got %s", got.Status)
+	}
+	if got.ResultSuccess == nil || !*got.ResultSuccess {
+		t.Error("expected result_success = true")
+	}
+	if got.ResultSummary != "all done" {
+		t.Errorf("summary: want %q, got %q", "all done", got.ResultSummary)
+	}
+}
+
+func TestPlanStore_Verify(t *testing.T) {
+	dbURL := testDB(t)
+	ps, err := NewPlanStore(dbURL)
+	if err != nil {
+		t.Fatalf("NewPlanStore: %v", err)
+	}
+	defer ps.Close() //nolint:errcheck
+
+	stored, err := ps.StorePlan(Plan{
+		DeveloperID: "test-dev-verify",
+		Title:       "Verify test",
+		TaskPrompt:  "test",
+		Steps:       []string{"step 1"},
+	})
+	if err != nil {
+		t.Fatalf("StorePlan: %v", err)
+	}
+
+	if err := ps.VerifyPlan(stored.ID, true, "looks good"); err != nil {
+		t.Fatalf("VerifyPlan: %v", err)
+	}
+
+	got, err := ps.GetPlanByID(stored.ID)
+	if err != nil {
+		t.Fatalf("GetPlanByID: %v", err)
+	}
+	if got.Status != PlanVerified {
+		t.Errorf("expected verified, got %s", got.Status)
+	}
+}
+
+func TestPlanStore_ListPlans(t *testing.T) {
+	dbURL := testDB(t)
+	ps, err := NewPlanStore(dbURL)
+	if err != nil {
+		t.Fatalf("NewPlanStore: %v", err)
+	}
+	defer ps.Close() //nolint:errcheck
+
+	devID := "test-dev-list"
+	for i := 0; i < 3; i++ {
+		_, err := ps.StorePlan(Plan{
+			DeveloperID: devID,
+			Title:       "Plan",
+			TaskPrompt:  "test",
+			Steps:       []string{"step 1"},
+		})
+		if err != nil {
+			t.Fatalf("StorePlan: %v", err)
+		}
+	}
+
+	summaries, total, err := ps.ListPlans(devID, 10, 0)
+	if err != nil {
+		t.Fatalf("ListPlans: %v", err)
+	}
+	if len(summaries) < 3 {
+		t.Errorf("expected at least 3 summaries, got %d", len(summaries))
+	}
+	if total < 3 {
+		t.Errorf("expected total >= 3, got %d", total)
+	}
+}
+
+func TestPlanStore_StatusTransitions(t *testing.T) {
+	dbURL := testDB(t)
+	ps, err := NewPlanStore(dbURL)
+	if err != nil {
+		t.Fatalf("NewPlanStore: %v", err)
+	}
+	defer ps.Close() //nolint:errcheck
+
+	devID := "test-dev-transitions"
+	stored, _ := ps.StorePlan(Plan{
+		DeveloperID: devID, Title: "T", TaskPrompt: "t", Steps: []string{"s"},
+	})
+
+	// pending → executing (via GetLatestPlan)
+	got, _ := ps.GetLatestPlan(devID)
+	if got.Status != PlanExecuting {
+		t.Errorf("step 1: want executing, got %s", got.Status)
+	}
+
+	// executing → completed (via StorePlanResult)
+	ps.StorePlanResult(stored.ID, true, "done", nil, true, "") //nolint:errcheck
+	got, _ = ps.GetPlanByID(stored.ID)
+	if got.Status != PlanCompleted {
+		t.Errorf("step 2: want completed, got %s", got.Status)
+	}
+
+	// completed → verified (via VerifyPlan)
+	ps.VerifyPlan(stored.ID, true, "ok") //nolint:errcheck
+	got, _ = ps.GetPlanByID(stored.ID)
+	if got.Status != PlanVerified {
+		t.Errorf("step 3: want verified, got %s", got.Status)
+	}
 }
 
 // ============================================================
 // ROUTER TESTS
 // ============================================================
 
-func TestRouter_SkillMatch(t *testing.T) {
-	cfg := defaultConfig()
-	router := NewRouter(
-		&mockSkillMatcher{match: &SkillMatch{
-			SkillID: "skill-1", Name: "fix-auth", SuccessRate: 0.90, GraphOverlap: 0.8,
-		}},
-		nil, nil, cfg,
-	)
+type mockSkillChecker struct {
+	found      bool
+	confidence float64
+}
 
-	task := Task{ID: "t1", Prompt: "fix bug", GraphNodeIDs: []string{"node1"}}
-	dec, err := router.Route(task)
+func (m *mockSkillChecker) HasMatch(graphNodeIDs []string, taskText string) (bool, string, string, float64, error) {
+	return m.found, "skill-1", "TypeFixer", m.confidence, nil
+}
+
+type mockMemoryChecker struct {
+	found bool
+	count int
+}
+
+func (m *mockMemoryChecker) HasRelevant(graphNodeIDs []string, developerID string) (bool, int, error) {
+	return m.found, m.count, nil
+}
+
+type mockGraphChecker struct {
+	nodeCount int
+	crossRepo bool
+}
+
+func (m *mockGraphChecker) CountAffectedNodes(nodeIDs []string) (int, error) {
+	return m.nodeCount, nil
+}
+func (m *mockGraphChecker) IsCrossRepo(nodeIDs []string) (bool, error) {
+	return m.crossRepo, nil
+}
+
+func TestRouter_SkillAvailable(t *testing.T) {
+	r := NewRouter(&mockSkillChecker{found: true, confidence: 0.92}, nil, nil)
+	rec, err := r.Recommend([]string{"node1"}, "fix the type error", "dev1")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Recommend: %v", err)
 	}
-	if dec.Mode != ModeSkillExecute {
-		t.Errorf("expected ModeSkillExecute, got %s", dec.Mode)
+	if !rec.SkillAvailable {
+		t.Error("expected skill_available = true")
 	}
-	if !dec.SkipPlanning {
-		t.Error("expected SkipPlanning=true")
-	}
-	if dec.VerifyTier != VerifyAutomated {
-		t.Errorf("expected VerifyAutomated, got %d", dec.VerifyTier)
+	if rec.SkillName != "TypeFixer" {
+		t.Errorf("skill name: want TypeFixer, got %s", rec.SkillName)
 	}
 }
 
-func TestRouter_MemoryMatch(t *testing.T) {
-	cfg := defaultConfig()
-	router := NewRouter(
-		&mockSkillMatcher{match: nil},
-		&mockMemoryRecaller{check: &MemoryCheck{HasExactMatch: true, Confidence: 0.95}},
-		nil, cfg,
-	)
-
-	task := Task{ID: "t2", Prompt: "apply fix", GraphNodeIDs: []string{"node1"}}
-	dec, err := router.Route(task)
+func TestRouter_MemoryAvailable(t *testing.T) {
+	r := NewRouter(nil, &mockMemoryChecker{found: true, count: 3}, nil)
+	rec, err := r.Recommend([]string{"node1"}, "fix the handler", "dev1")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Recommend: %v", err)
 	}
-	if dec.Mode != ModeMemoryApply {
-		t.Errorf("expected ModeMemoryApply, got %s", dec.Mode)
+	if !rec.MemoryAvailable {
+		t.Error("expected memory_available = true")
 	}
-	if !dec.MemoryHit {
-		t.Error("expected MemoryHit=true")
-	}
-	if dec.VerifyTier != VerifySpotCheck {
-		t.Errorf("expected VerifySpotCheck, got %d", dec.VerifyTier)
+	if rec.MemoryCount != 3 {
+		t.Errorf("memory count: want 3, got %d", rec.MemoryCount)
 	}
 }
 
-func TestRouter_SimplePlanExecute(t *testing.T) {
-	cfg := defaultConfig()
-	router := NewRouter(
-		&mockSkillMatcher{match: nil},
-		&mockMemoryRecaller{check: nil},
-		&mockGraphAnalyzer{nodeCount: 2, crossRepo: false},
-		cfg,
-	)
-
-	task := Task{ID: "t3", Prompt: "fix the null pointer", TaskType: TaskCodeFix, GraphNodeIDs: []string{"n1", "n2"}}
-	dec, err := router.Route(task)
-	if err != nil {
-		t.Fatal(err)
+func TestRouter_RiskLevel(t *testing.T) {
+	tests := []struct {
+		nodes     int
+		crossRepo bool
+		want      string
+	}{
+		{1, false, "low"},
+		{2, false, "low"},
+		{3, false, "medium"},
+		{5, false, "medium"},
+		{2, true, "medium"},
+		{6, true, "high"},
 	}
-	if dec.Mode != ModePlanExecute {
-		t.Errorf("expected ModePlanExecute, got %s", dec.Mode)
+
+	for _, tc := range tests {
+		r := NewRouter(nil, nil, &mockGraphChecker{nodeCount: tc.nodes, crossRepo: tc.crossRepo})
+		rec, err := r.Recommend([]string{"node1"}, "task", "dev1")
+		if err != nil {
+			t.Fatalf("Recommend: %v", err)
+		}
+		if rec.RiskLevel != tc.want {
+			t.Errorf("nodes=%d crossRepo=%v: want %s, got %s",
+				tc.nodes, tc.crossRepo, tc.want, rec.RiskLevel)
+		}
 	}
 }
 
-func TestRouter_ComplexFullOrch(t *testing.T) {
-	cfg := defaultConfig()
-	router := NewRouter(
-		&mockSkillMatcher{match: nil},
-		&mockMemoryRecaller{check: nil},
-		&mockGraphAnalyzer{nodeCount: 5, crossRepo: true},
-		cfg,
-	)
-
-	task := Task{ID: "t4", Prompt: "fix cross-repo auth", TaskType: TaskCodeFix,
-		GraphNodeIDs: []string{"n1", "n2", "n3", "n4", "n5"}}
-	dec, err := router.Route(task)
+func TestRouter_NoSkillNoMemory(t *testing.T) {
+	r := NewRouter(nil, nil, nil)
+	rec, err := r.Recommend(nil, "do something general", "dev1")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Recommend: %v", err)
 	}
-	if dec.Mode != ModeFullOrchestration {
-		t.Errorf("expected ModeFullOrchestration, got %s", dec.Mode)
+	if rec.SkillAvailable {
+		t.Error("expected no skill")
 	}
-	if dec.VerifyTier != VerifyFullReview {
-		t.Errorf("expected VerifyFullReview, got %d", dec.VerifyTier)
+	if rec.MemoryAvailable {
+		t.Error("expected no memory")
+	}
+	if rec.RiskLevel != "low" {
+		t.Errorf("risk: want low, got %s", rec.RiskLevel)
 	}
 }
 
-func TestRouter_NoTemplateOpus(t *testing.T) {
-	cfg := defaultConfig()
-	router := NewRouter(
-		&mockSkillMatcher{match: nil},
-		&mockMemoryRecaller{check: nil},
-		&mockGraphAnalyzer{nodeCount: 10, crossRepo: false},
-		cfg,
-	)
+// ============================================================
+// WORKSPACE TESTS
+// ============================================================
 
-	// many graph nodes → !simple → no template → ModeSingleOpus
-	task := Task{
-		ID:           "t5",
-		Prompt:       "explain why this pattern exists",
-		TaskType:     TaskExplanation,
-		GraphNodeIDs: []string{"n1", "n2", "n3", "n4", "n5"},
+func TestGenerateWorkspaces(t *testing.T) {
+	dir := t.TempDir()
+	if err := GenerateWorkspaces(dir, "claude-opus-4", "claude-haiku-3.5"); err != nil {
+		t.Fatalf("GenerateWorkspaces: %v", err)
 	}
-	dec, err := router.Route(task)
-	if err != nil {
-		t.Fatal(err)
+
+	plannerPath := filepath.Join(dir, ".universe", "workspaces", "planner.code-workspace")
+	if _, err := os.Stat(plannerPath); err != nil {
+		t.Errorf("planner workspace missing: %v", err)
 	}
-	if dec.Mode != ModeSingleOpus {
-		t.Errorf("expected ModeSingleOpus, got %s", dec.Mode)
+
+	executorPath := filepath.Join(dir, ".universe", "workspaces", "executor.code-workspace")
+	if _, err := os.Stat(executorPath); err != nil {
+		t.Errorf("executor workspace missing: %v", err)
 	}
 }
 
-func TestRouter_SimpleHaiku(t *testing.T) {
-	cfg := defaultConfig()
-	router := NewRouter(
-		&mockSkillMatcher{match: nil},
-		&mockMemoryRecaller{check: nil},
-		&mockGraphAnalyzer{nodeCount: 1, crossRepo: false},
-		cfg,
-	)
-
-	task := Task{ID: "t6", Prompt: "do something general", TaskType: TaskGeneral, GraphNodeIDs: []string{"n1"}}
-	dec, err := router.Route(task)
-	if err != nil {
-		t.Fatal(err)
+func TestWorkspaces_CorrectPaths(t *testing.T) {
+	dir := t.TempDir()
+	if err := GenerateWorkspaces(dir, "gpt-4o", "gpt-4o-mini"); err != nil {
+		t.Fatalf("GenerateWorkspaces: %v", err)
 	}
-	if dec.Mode != ModeSingleHaiku {
-		t.Errorf("expected ModeSingleHaiku, got %s", dec.Mode)
+
+	data, err := os.ReadFile(filepath.Join(dir, ".universe", "workspaces", "planner.code-workspace"))
+	if err != nil {
+		t.Fatalf("read planner workspace: %v", err)
+	}
+	if !strContains(string(data), "gpt-4o") {
+		t.Error("planner workspace should contain gpt-4o")
+	}
+
+	data, err = os.ReadFile(filepath.Join(dir, ".universe", "workspaces", "executor.code-workspace"))
+	if err != nil {
+		t.Fatalf("read executor workspace: %v", err)
+	}
+	if !strContains(string(data), "gpt-4o-mini") {
+		t.Error("executor workspace should contain gpt-4o-mini")
 	}
 }
 
-func TestRouter_SkillBelowThreshold(t *testing.T) {
-	cfg := defaultConfig()
-	router := NewRouter(
-		&mockSkillMatcher{match: &SkillMatch{
-			SkillID: "skill-low", SuccessRate: 0.60, GraphOverlap: 0.8,
-		}},
-		&mockMemoryRecaller{check: nil},
-		&mockGraphAnalyzer{nodeCount: 2, crossRepo: false},
-		cfg,
-	)
+// ============================================================
+// SETUP TESTS
+// ============================================================
 
-	task := Task{ID: "t7", Prompt: "fix bug", TaskType: TaskCodeFix, GraphNodeIDs: []string{"n1"}}
-	dec, err := router.Route(task)
+func TestRunSetup(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	err := RunSetup(dir, cfg.PremiumModel.Name, cfg.ExecutionModel.Name,
+		cfg.PremiumModel, cfg.ExecutionModel, "")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("RunSetup: %v", err)
 	}
-	if dec.Mode == ModeSkillExecute {
-		t.Error("should NOT route to ModeSkillExecute when below threshold")
+
+	files := []string{
+		".universe/workspaces/planner.code-workspace",
+		".universe/workspaces/executor.code-workspace",
+		".cursor/rules/universe-planner.mdc",
+		".cursor/rules/universe-executor.mdc",
+		".cursor/rules/universe-compression.mdc",
+		".cursor/mcp.json",
+	}
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			t.Errorf("missing file %s: %v", f, err)
+		}
 	}
 }
+
+func TestRunSetup_PreserveMCPConfig(t *testing.T) {
+	dir := t.TempDir()
+	mcpDir := filepath.Join(dir, ".cursor")
+	os.MkdirAll(mcpDir, 0755)              //nolint:errcheck
+	existing := []byte(`{"custom": true}`) //nolint:errcheck
+	os.WriteFile(filepath.Join(mcpDir, "mcp.json"), existing, 0644) //nolint:errcheck
+
+	cfg := DefaultConfig()
+	RunSetup(dir, cfg.PremiumModel.Name, cfg.ExecutionModel.Name, cfg.PremiumModel, cfg.ExecutionModel, "") //nolint:errcheck
+
+	data, _ := os.ReadFile(filepath.Join(dir, ".cursor", "mcp.json"))
+	if string(data) != string(existing) {
+		t.Errorf("mcp.json should not be overwritten; got %s", string(data))
+	}
+}
+
+func TestCursorRules_ModelNames(t *testing.T) {
+	dir := t.TempDir()
+	RunSetup(dir, "gpt-4o", "gpt-4o-mini", ModelConfig{}, ModelConfig{}, "") //nolint:errcheck
+
+	plannerRule, _ := os.ReadFile(filepath.Join(dir, ".cursor", "rules", "universe-planner.mdc"))
+	if !strContains(string(plannerRule), "gpt-4o") {
+		t.Error("planner rule should reference gpt-4o")
+	}
+
+	executorRule, _ := os.ReadFile(filepath.Join(dir, ".cursor", "rules", "universe-executor.mdc"))
+	if !strContains(string(executorRule), "gpt-4o-mini") {
+		t.Error("executor rule should reference gpt-4o-mini")
+	}
+}
+
+// ============================================================
+// TRACKER TESTS (require DATABASE_URL)
+// ============================================================
+
+func TestTracker_LogCost(t *testing.T) {
+	dbURL := testDB(t)
+	tr, err := NewTracker(dbURL)
+	if err != nil {
+		t.Fatalf("NewTracker: %v", err)
+	}
+	defer tr.Close()
+
+	cost := PlanCost{
+		DeveloperID:             "test-tracker-dev",
+		PlannerModel:            "claude-opus-4",
+		ExecutorModel:           "claude-haiku-3.5",
+		EstimatedPlannerTokens:  1000,
+		EstimatedExecutorTokens: 2000,
+		EstimatedPlannerCost:    0.015,
+		EstimatedExecutorCost:   0.001,
+		EstimatedTotalCost:      0.016,
+		EstimatedAllPremiumCost: 0.045,
+		EstimatedSavings:        0.029,
+		SkillUsed:               true,
+		MemoryHit:               false,
+		RoutingRecommendation:   "skill_available",
+	}
+	if err := tr.LogPlanCost(cost); err != nil {
+		t.Fatalf("LogPlanCost: %v", err)
+	}
+}
+
+func TestTracker_MonthlySummary(t *testing.T) {
+	dbURL := testDB(t)
+	tr, err := NewTracker(dbURL)
+	if err != nil {
+		t.Fatalf("NewTracker: %v", err)
+	}
+	defer tr.Close()
+
+	tr.LogPlanCost(PlanCost{ //nolint:errcheck
+		DeveloperID:             "test-summary-dev",
+		EstimatedTotalCost:      0.01,
+		EstimatedAllPremiumCost: 0.05,
+		EstimatedSavings:        0.04,
+	})
+
+	summaries, err := tr.GetMonthlySummary()
+	if err != nil {
+		t.Fatalf("GetMonthlySummary: %v", err)
+	}
+	if len(summaries) == 0 {
+		t.Error("expected at least one monthly summary entry")
+	}
+}
+
+// ============================================================
+// CLASSIFY TASK TYPE TESTS
+// ============================================================
 
 func TestClassifyTaskType(t *testing.T) {
-	cases := []struct {
-		prompt   string
-		expected TaskType
+	tests := []struct {
+		prompt string
+		want   string
 	}{
-		{"fix the type mismatch in auth.go", TaskCodeFix},
-		{"write tests for ValidateToken function", TaskTestGen},
-		{"create a PR description for this change", TaskPRGen},
-		{"explain why this pattern breaks on nil", TaskExplanation},
-		{"update the database config to use TLS", TaskConfigChange},
-		{"refactor the login handler", TaskRefactor},
-		{"upgrade the pgx dependency to v6", TaskDepUpdate},
-		{"analyze the impact of removing this function", TaskAnalysis},
-		{"migrate the users table schema", TaskMigration},
+		{"fix the bug in handler", "code_fix"},
+		{"write tests for the auth package", "test_gen"},
+		{"refactor the database layer", "refactor"},
+		{"migrate the users table", "migration"},
+		{"explain how the router works", "explanation"},
+		{"do something general", "general"},
 	}
-
-	for _, tc := range cases {
+	for _, tc := range tests {
 		got := ClassifyTaskType(tc.prompt)
-		if got != tc.expected {
-			t.Errorf("ClassifyTaskType(%q) = %s, want %s", tc.prompt, got, tc.expected)
+		if got != tc.want {
+			t.Errorf("ClassifyTaskType(%q) = %s, want %s", tc.prompt, got, tc.want)
 		}
 	}
 }
 
-// ============================================================
-// PLANNER TESTS
-// ============================================================
-
-func TestValidatePlan_CircularDeps(t *testing.T) {
-	plan := &Plan{
-		TaskID: "task-1",
-		SubTasks: []SubTask{
-			{ID: "a", Action: "modify_file", DependsOn: []string{"b"}, VerifyTier: 1},
-			{ID: "b", Action: "modify_file", DependsOn: []string{"a"}, VerifyTier: 1},
-		},
-	}
-	if err := ValidatePlan(plan); err == nil {
-		t.Error("expected error for circular dependency")
-	}
-}
-
-func TestValidatePlan_Valid(t *testing.T) {
-	plan := &Plan{
-		TaskID: "task-2",
-		SubTasks: []SubTask{
-			{ID: "a", Action: "modify_file", DependsOn: nil, VerifyTier: 1},
-			{ID: "b", Action: "generate_test", DependsOn: []string{"a"}, VerifyTier: 1},
-		},
-	}
-	if err := ValidatePlan(plan); err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestValidatePlan_TooManySubTasks(t *testing.T) {
-	plan := &Plan{TaskID: "t"}
-	for i := 0; i < 6; i++ {
-		plan.SubTasks = append(plan.SubTasks, SubTask{
-			ID: fmt.Sprintf("s%d", i), Action: "modify_file", VerifyTier: 1,
-		})
-	}
-	if err := ValidatePlan(plan); err == nil {
-		t.Error("expected error for too many sub-tasks")
-	}
-}
-
-// ============================================================
-// VERIFIER TESTS
-// ============================================================
-
-func TestVerifier_AutomatedCatchesSyntax(t *testing.T) {
-	v := &Verifier{}
-	result := &SubTaskResult{
-		Success: true,
-		Output:  "package main\n\nfunc Broken( {\n}",
-	}
-	subTask := SubTask{Action: "modify_file", VerifyTier: VerifyAutomated}
-	vr, err := v.verifyAutomated(subTask, result)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if vr.Passed {
-		t.Error("expected syntax error to fail verification")
-	}
-	if vr.TokensUsed != 0 {
-		t.Errorf("expected 0 tokens for automated check, got %d", vr.TokensUsed)
-	}
-}
-
-func TestVerifier_AutomatedPassesValidGo(t *testing.T) {
-	v := &Verifier{}
-	result := &SubTaskResult{
-		Success: true,
-		Output:  "package main\n\nfunc Hello() string {\n\treturn \"hello\"\n}\n",
-	}
-	subTask := SubTask{Action: "modify_file", VerifyTier: VerifyAutomated}
-	vr, err := v.verifyAutomated(subTask, result)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !vr.Passed {
-		t.Errorf("expected valid Go to pass, got reason: %s", vr.Reason)
-	}
-}
-
-func TestVerifier_AutomatedFailsOnEmpty(t *testing.T) {
-	v := &Verifier{}
-	result := &SubTaskResult{Success: false, ErrorMessage: "haiku failed"}
-	subTask := SubTask{Action: "modify_file", VerifyTier: VerifyAutomated}
-	vr, _ := v.verifyAutomated(subTask, result)
-	if vr.Passed {
-		t.Error("expected failure for failed executor result")
-	}
-}
-
-// ============================================================
-// ESCALATION TESTS
-// ============================================================
-
-type callTracker struct {
-	calls []ModelTier
-}
-
-func TestEscalation_AllStepsRunWithNilClient(t *testing.T) {
-	// with nil LLM client: executor returns "no LLM client" error for all steps,
-	// rephrase and takeover also return errors → HandleFailure returns error after 3 steps
-	executor := NewExecutor(nil, nil, defaultConfig())
-	esc := NewEscalation(executor, nil, nil, defaultConfig())
-
-	failed := &SubTaskResult{SubTaskID: "s1", Success: false, ErrorMessage: "initial error"}
-	subTask := SubTask{ID: "s1", Action: "modify_file", VerifyTier: 1}
-
-	_, record, err := esc.HandleFailure(subTask, failed, "fix bug", nil)
-	// expected: error after all steps exhausted
-	if err == nil {
-		t.Error("expected error when all escalation steps fail")
-	}
-	// record should have at least step 1 logged
-	if record == nil {
-		t.Fatal("expected escalation record")
-	}
-	if len(record.Steps) == 0 {
-		t.Error("expected at least one escalation step recorded")
-	}
-}
-
-func TestEscalation_RecordSubTaskID(t *testing.T) {
-	executor := NewExecutor(nil, nil, defaultConfig())
-	esc := NewEscalation(executor, nil, nil, defaultConfig())
-
-	failed := &SubTaskResult{SubTaskID: "my-subtask", Success: false, ErrorMessage: "err"}
-	subTask := SubTask{ID: "my-subtask", Action: "modify_file", VerifyTier: 1}
-
-	_, record, _ := esc.HandleFailure(subTask, failed, "context", nil)
-	if record.SubTaskID != "my-subtask" {
-		t.Errorf("expected SubTaskID=my-subtask, got %s", record.SubTaskID)
-	}
-}
-
-// ============================================================
-// PARALLEL EXECUTION TESTS
-// ============================================================
-
-func TestParallel_BuildDependencyGraph(t *testing.T) {
-	subTasks := []SubTask{
-		{ID: "a", DependsOn: nil},
-		{ID: "b", DependsOn: nil},
-		{ID: "c", DependsOn: []string{"a"}},
-	}
-	ready, dependsOn, dependedBy := buildDependencyGraph(subTasks)
-
-	if len(ready) != 2 {
-		t.Errorf("expected 2 ready tasks, got %d: %v", len(ready), ready)
-	}
-	if len(dependsOn["c"]) != 1 || dependsOn["c"][0] != "a" {
-		t.Errorf("c should depend on a, got %v", dependsOn["c"])
-	}
-	if len(dependedBy["a"]) != 1 || dependedBy["a"][0] != "c" {
-		t.Errorf("a should be depended on by c, got %v", dependedBy["a"])
-	}
-}
-
-func TestParallel_IndependentTasks(t *testing.T) {
-	plan := &Plan{
-		TaskID: "task-parallel",
-		SubTasks: []SubTask{
-			{ID: "a", Action: "modify_file", DependsOn: nil, VerifyTier: 1},
-			{ID: "b", Action: "modify_file", DependsOn: nil, VerifyTier: 1},
-			{ID: "c", Action: "modify_file", DependsOn: nil, VerifyTier: 1},
-		},
-	}
-
-	// executor with nil client — all sub-tasks fail (we just check they all run)
-	executor := NewExecutor(nil, nil, defaultConfig())
-	esc := NewEscalation(executor, nil, nil, defaultConfig())
-	pe := NewParallelExecutor(executor, esc, defaultConfig())
-
-	results, _, _ := pe.ExecuteAll(plan, "test prompt")
-	if len(results) != 3 {
-		t.Errorf("expected 3 results, got %d", len(results))
-	}
-}
-
-func TestParallel_DependentTasks(t *testing.T) {
-	plan := &Plan{
-		TaskID: "task-deps",
-		SubTasks: []SubTask{
-			{ID: "a", Action: "modify_file", DependsOn: nil, VerifyTier: 1},
-			{ID: "b", Action: "modify_file", DependsOn: []string{"a"}, VerifyTier: 1},
-		},
-	}
-
-	ready, _, _ := buildDependencyGraph(plan.SubTasks)
-	if len(ready) != 1 || ready[0] != "a" {
-		t.Errorf("only 'a' should be initially ready, got %v", ready)
-	}
-}
-
-func TestParallel_MixedDeps(t *testing.T) {
-	plan := &Plan{
-		TaskID: "task-mixed",
-		SubTasks: []SubTask{
-			{ID: "a", Action: "modify_file", DependsOn: nil, VerifyTier: 1},
-			{ID: "b", Action: "modify_file", DependsOn: nil, VerifyTier: 1},
-			{ID: "c", Action: "modify_file", DependsOn: []string{"a"}, VerifyTier: 1},
-		},
-	}
-
-	ready, dependsOn, dependedBy := buildDependencyGraph(plan.SubTasks)
-
-	// a and b should be ready, c should not
-	readySet := make(map[string]bool)
-	for _, id := range ready {
-		readySet[id] = true
-	}
-	if !readySet["a"] || !readySet["b"] {
-		t.Errorf("a and b should be ready, got %v", ready)
-	}
-	if readySet["c"] {
-		t.Error("c should not be ready (depends on a)")
-	}
-
-	// c depends on a
-	if len(dependsOn["c"]) != 1 {
-		t.Error("c should depend on a")
-	}
-	// a is depended on by c
-	if len(dependedBy["a"]) != 1 || dependedBy["a"][0] != "c" {
-		t.Errorf("a should be depended on by c, got %v", dependedBy["a"])
-	}
-}
-
-// ============================================================
-// COST CALCULATION TESTS
-// ============================================================
-
-func TestCalculateCost_Opus(t *testing.T) {
-	// 1000 input tokens at $15/M = $0.000015
-	// 500 output tokens at $75/M = $0.0000375
-	cost := calculateCost(Opus, 1000, 500)
-	expected := (1000*15.0 + 500*75.0) / 1_000_000
-	if cost != expected {
-		t.Errorf("expected %.8f, got %.8f", expected, cost)
-	}
-}
-
-func TestCalculateCost_Haiku(t *testing.T) {
-	cost := calculateCost(Haiku, 1000, 500)
-	expected := (1000*0.25 + 500*1.25) / 1_000_000
-	if cost != expected {
-		t.Errorf("expected %.8f, got %.8f", expected, cost)
-	}
-}
-
-func TestCalculateCost_SavingsRatio(t *testing.T) {
-	tokens := 1_000_000
-	opusCost := calculateCost(Opus, tokens, tokens)
-	haikuCost := calculateCost(Haiku, tokens, tokens)
-	ratio := opusCost / haikuCost
-	// Roughly 30-60x cheaper
-	if ratio < 20 || ratio > 80 {
-		t.Errorf("expected ~30-60x cheaper, got %.1fx", ratio)
-	}
-}
-
-// ============================================================
-// TEMPLATE TESTS
-// ============================================================
-
-func TestHasTemplate(t *testing.T) {
-	cases := []struct {
-		taskType TaskType
-		expected bool
-	}{
-		{TaskCodeFix, true},
-		{TaskTestGen, true},
-		{TaskPRGen, true},
-		{TaskRefactor, true},
-		{TaskDepUpdate, true},
-		{TaskConfigChange, true},
-		{TaskAnalysis, true},
-		{TaskExplanation, false},
-		{TaskGeneral, false},
-		{TaskMigration, false},
-	}
-	for _, tc := range cases {
-		got := HasTemplate(tc.taskType)
-		if got != tc.expected {
-			t.Errorf("HasTemplate(%s) = %v, want %v", tc.taskType, got, tc.expected)
-		}
-	}
-}
-
-func TestGetPlannerPrompt_ContainsSchema(t *testing.T) {
-	prompt := GetPlannerPrompt(TaskCodeFix, "node: validate.go [func]", "past fix: nil check", "")
-	if len(prompt) == 0 {
-		t.Error("expected non-empty prompt")
-	}
-	if !contains(prompt, "sub_tasks") {
-		t.Error("expected prompt to contain sub_tasks schema")
-	}
-	if !contains(prompt, "GRAPH CONTEXT") {
-		t.Error("expected prompt to contain GRAPH CONTEXT section")
-	}
-	if !contains(prompt, "MEMORY CONTEXT") {
-		t.Error("expected prompt to contain MEMORY CONTEXT section")
-	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr ||
-		len(s) > 0 && containsStr(s, substr))
-}
-
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
+// strContains is a simple substring check.
+func strContains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
 			return true
 		}
 	}
 	return false
-}
-
-// ============================================================
-// TRACKER TESTS (no DB required)
-// ============================================================
-
-func TestTracker_NoDB_DoesNotPanic(t *testing.T) {
-	tracker, err := NewTracker("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// should not panic even with nil pool
-	tracker.LogCall(CostRecord{
-		TaskID:      "t1",
-		DeveloperID: "dev1",
-		Model:       Haiku,
-		InputTokens: 100,
-		OutputTokens: 50,
-		CostUSD:     0.0001,
-		Phase:       "execute",
-		RoutingMode: ModeSkillExecute,
-	})
-	tracker.Stop()
-}
-
-func TestTracker_GetMonthlySummary_NoDB(t *testing.T) {
-	tracker, _ := NewTracker("")
-	summaries, err := tracker.GetMonthlySummary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if summaries != nil {
-		t.Error("expected nil summaries with no DB")
-	}
 }

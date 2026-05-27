@@ -1,10 +1,12 @@
 package skills
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // EmbedFunc converts text to a vector embedding.
@@ -193,18 +195,71 @@ func (m *Matcher) Match(query MatchQuery) (*MatchResult, error) {
 		candidates[i] = r.s.summary
 	}
 
+	// STEP 8: Add verification metadata to every candidate.
+	// Skills are reference knowledge — the planning agent (premium model) must
+	// verify before the execution agent uses them.
+	for i := range candidates {
+		candidates[i].RequiresVerification = true
+		candidates[i].VerificationPrompt = buildVerificationPrompt(candidates[i])
+	}
+
 	var best *SkillSummary
 	if len(candidates) > 0 && candidates[0].SearchScore > 0.3 {
 		cp := candidates[0]
 		best = &cp
 	}
 
-	method := matchMethod(len(res.graph) > 0, len(res.keyword) > 0, len(res.semantic) > 0)
-	return &MatchResult{
+	result := &MatchResult{
 		BestMatch:    best,
 		Candidates:   candidates,
-		SearchMethod: method,
-	}, nil
+		SearchMethod: matchMethod(len(res.graph) > 0, len(res.keyword) > 0, len(res.semantic) > 0),
+	}
+	if best != nil {
+		result.VerificationRequired = true
+		result.VerificationMessage = "Skill found but requires planning agent (premium model) verification before the execution agent can use it."
+	}
+	return result, nil
+}
+
+// buildVerificationPrompt generates guidance for the planning agent before it
+// approves a skill for the execution agent.
+func buildVerificationPrompt(skill SkillSummary) string {
+	var b strings.Builder
+
+	b.WriteString(fmt.Sprintf("Skill '%s' v%d", skill.Name, skill.Version))
+
+	successPct := 0.0
+	if skill.TimesApplied > 0 {
+		successPct = skill.SuccessRate * 100
+	}
+	b.WriteString(fmt.Sprintf(" — %.0f%% success rate over %d applications.\n", successPct, skill.TimesApplied))
+
+	// Stale warning
+	isStale := false
+	for _, tag := range skill.NegativeTags {
+		if tag.Context == "graph_changed" {
+			isStale = true
+			break
+		}
+	}
+	if isStale {
+		b.WriteString("WARNING: The code this skill covers has changed since the skill was last updated. Verify carefully.\n")
+	}
+
+	// Low-confidence note
+	if skill.Confidence < 0.7 {
+		b.WriteString(fmt.Sprintf("NOTE: This skill is still building confidence (%.0f%%). Only %d successful uses so far.\n",
+			skill.Confidence*100, skill.TimesApplied))
+	}
+
+	b.WriteString(fmt.Sprintf("\nVerification checklist (as of %s):\n", time.Now().Format("2006-01-02")))
+	b.WriteString("1. Does the skill instruction match the CURRENT code structure?\n")
+	b.WriteString("2. Are the file paths and function names still correct?\n")
+	b.WriteString("3. Is the approach still the best way to solve this type of problem?\n")
+	b.WriteString("\nIf all checks pass: include the skill steps in your plan for the execution agent.\n")
+	b.WriteString("If any check fails: ignore the skill and plan from scratch using graph context instead.")
+
+	return b.String()
 }
 
 // CalculateGraphOverlap computes the fraction of query nodes covered by the skill.

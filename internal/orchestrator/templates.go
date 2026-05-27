@@ -3,7 +3,35 @@ package orchestrator
 import "fmt"
 
 // ============================================================
+// TASK TYPES — used for template selection and dashboard grouping
+// ============================================================
+
+type TaskType string
+
+const (
+	TaskCodeFix      TaskType = "code_fix"
+	TaskTestGen      TaskType = "test_gen"
+	TaskPRGen        TaskType = "pr_gen"
+	TaskRefactor     TaskType = "refactor"
+	TaskDepUpdate    TaskType = "dependency_update"
+	TaskConfigChange TaskType = "config_change"
+	TaskMigration    TaskType = "migration"
+	TaskAnalysis     TaskType = "analysis"
+	TaskExplanation  TaskType = "explanation"
+	TaskGeneral      TaskType = "general"
+)
+
+// ============================================================
 // SPEC TEMPLATES
+//
+// Each template defines a structured format for plans.
+// The planner agent (premium model in Cursor) can use these as a guide
+// for writing clear, specific plans. The executor agent follows the plan
+// step by step.
+//
+// These templates are NOT enforced by Universe. They're provided as
+// MCP tool documentation so the planner knows what format works best.
+// The planner can write plans in any format — these are suggestions.
 // ============================================================
 
 type CodeFixSpec struct {

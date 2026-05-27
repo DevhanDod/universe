@@ -225,6 +225,50 @@ func (s *Server) HandleRoutingDetail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, detail)
 }
 
+// ── Plans ─────────────────────────────────────────────────────────────────────
+
+func (s *Server) HandlePlansList(w http.ResponseWriter, r *http.Request) {
+	page, limit := pageParam(r)
+	result, err := QueryPlansList(s.db, PlanFilters{
+		DeveloperID: queryParam(r, "developer"),
+		Status:      queryParam(r, "status"),
+		Page:        page,
+		Limit:       limit,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) HandlePlanDetail(w http.ResponseWriter, r *http.Request) {
+	id := pathSegment(r, 2) // /api/plans/:id
+	if id == "" || id == "stats" {
+		writeError(w, http.StatusBadRequest, "missing plan id")
+		return
+	}
+	if s.db == nil {
+		writeError(w, http.StatusServiceUnavailable, "no database")
+		return
+	}
+	detail, err := QueryPlanDetail(s.db, id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "plan not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+func (s *Server) HandlePlanStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := QueryPlanStats(s.db, queryParam(r, "developer"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
 // ── Graph ─────────────────────────────────────────────────────────────────────
 
 func (s *Server) HandleGraphNodes(w http.ResponseWriter, r *http.Request) {

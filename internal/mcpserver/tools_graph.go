@@ -24,8 +24,8 @@ type NodeInfo struct {
 // ============================================================
 
 type GetDependenciesInput struct {
-	Name  string `json:"name" jsonschema:"required,description=Function or type name to look up (e.g. ValidateToken or auth.ValidateToken)"`
-	Depth int    `json:"depth,omitempty" jsonschema:"description=How many levels deep to traverse (default 1)"`
+	Name  string `json:"name"`
+	Depth int    `json:"depth,omitempty"`
 }
 
 type GetDependenciesOutput struct {
@@ -76,7 +76,7 @@ func (h *Handlers) HandleGetDependencies(
 // ============================================================
 
 type ImpactAnalysisInput struct {
-	Name string `json:"name" jsonschema:"required,description=Function or type name to analyze impact for"`
+	Name string `json:"name"`
 }
 
 type ImpactAnalysisOutput struct {
@@ -151,8 +151,8 @@ func (h *Handlers) HandleGetImpactAnalysis(
 // ============================================================
 
 type SearchGraphInput struct {
-	Query string `json:"query" jsonschema:"required,description=Search term — function name, type name, or package name"`
-	Limit int    `json:"limit,omitempty" jsonschema:"description=Max results (default 10)"`
+	Query string `json:"query"`
+	Limit int    `json:"limit,omitempty"`
 }
 
 type SearchGraphOutput struct {

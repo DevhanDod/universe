@@ -83,6 +83,16 @@ func (s *Server) Start() error {
 	}))
 	mux.HandleFunc("/api/routing", corsMiddleware(s.HandleRoutingList))
 
+	mux.HandleFunc("/api/plans/stats", corsMiddleware(s.HandlePlanStats))
+	mux.HandleFunc("/api/plans/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.URL.Path) > len("/api/plans/") {
+			s.HandlePlanDetail(w, r)
+		} else {
+			s.HandlePlansList(w, r)
+		}
+	}))
+	mux.HandleFunc("/api/plans", corsMiddleware(s.HandlePlansList))
+
 	mux.HandleFunc("/api/graph/nodes", corsMiddleware(s.HandleGraphNodes))
 	mux.HandleFunc("/api/graph/edges", corsMiddleware(s.HandleGraphEdges))
 	mux.HandleFunc("/api/graph/node/", corsMiddleware(s.HandleGraphNodeDetail))

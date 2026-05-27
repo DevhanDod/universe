@@ -13,10 +13,10 @@ import (
 // ============================================================
 
 type RecallMemoryInput struct {
-	Query        string   `json:"query,omitempty" jsonschema:"description=Text to search for. Optional if graph_node_ids provided."`
-	GraphNodeIDs []string `json:"graph_node_ids,omitempty" jsonschema:"description=Graph node IDs to search by."`
-	Categories   []string `json:"categories,omitempty" jsonschema:"description=Filter by category: fix pattern decision failure convention"`
-	Limit        int      `json:"limit,omitempty" jsonschema:"description=Max results (default 10)"`
+	Query        string   `json:"query,omitempty"`
+	GraphNodeIDs []string `json:"graph_node_ids,omitempty"`
+	Categories   []string `json:"categories,omitempty"`
+	Limit        int      `json:"limit,omitempty"`
 }
 
 type RecallMemoryOutput struct {
@@ -57,6 +57,7 @@ func (h *Handlers) HandleRecallMemory(
 		GraphNodeIDs:          input.GraphNodeIDs,
 		Categories:            input.Categories,
 		Limit:                 limit,
+		DeveloperID:           "cursor-agent",
 		IncludeGraphNeighbors: true,
 	})
 	if err != nil {
@@ -88,7 +89,7 @@ func (h *Handlers) HandleRecallMemory(
 // ============================================================
 
 type GetObservationDetailsInput struct {
-	IDs []string `json:"ids" jsonschema:"required,description=List of observation UUIDs to retrieve full details for"`
+	IDs []string `json:"ids"`
 }
 
 type GetObservationDetailsOutput struct {
@@ -145,11 +146,10 @@ func (h *Handlers) HandleGetObservationDetails(
 // ============================================================
 
 type StoreObservationInput struct {
-	GraphNodeID string `json:"graph_node_id" jsonschema:"required,description=The graph node this observation relates to"`
-	Category    string `json:"category" jsonschema:"required,description=Category: fix pattern decision failure convention"`
-	Content     string `json:"content" jsonschema:"required,description=The observation text to store."`
-	RepoID      string `json:"repo_id,omitempty" jsonschema:"description=Repository identifier"`
-	Shared      bool   `json:"shared,omitempty" jsonschema:"description=Make visible to the whole team (default false)"`
+	GraphNodeID string `json:"graph_node_id"`
+	Category    string `json:"category"`
+	Content     string `json:"content"`
+	RepoID      string `json:"repo_id,omitempty"`
 }
 
 type StoreObservationOutput struct {
@@ -174,7 +174,7 @@ func (h *Handlers) HandleStoreObservation(
 		Category:    input.Category,
 		Summary:     input.Content,
 		RepoID:      input.RepoID,
-		Shared:      input.Shared,
+		Shared:      false,
 		Confidence:  1.0,
 		DeveloperID: "cursor-agent",
 	}
@@ -190,6 +190,6 @@ func (h *Handlers) HandleStoreObservation(
 	return nil, StoreObservationOutput{
 		ID:      stored.ID,
 		Summary: stored.Summary,
-		Message: "Observation stored and will be recalled in future sessions.",
+		Message: "Observation stored in your personal memory and will be recalled in your future sessions.",
 	}, nil
 }

@@ -3,176 +3,120 @@ package orchestrator
 import "time"
 
 // ============================================================
-// MODELS
+// MODELS — developer configures their own model preferences
 // ============================================================
 
-type ModelTier string
-
-const (
-	Opus  ModelTier = "opus"
-	Haiku ModelTier = "haiku"
-)
-
+// ModelConfig represents a developer's chosen model.
+// Universe doesn't call these models — Cursor does.
+// This config is used for cost estimation and dashboard display.
 type ModelConfig struct {
-	Tier           ModelTier
-	ModelID        string
-	APIKey         string
-	Endpoint       string
-	MaxTokens      int
-	InputCostPerM  float64
-	OutputCostPerM float64
-	MaxConcurrent  int
+	Name           string  `json:"name"`             // "claude-opus-4", "gpt-4o", etc.
+	Provider       string  `json:"provider"`          // "anthropic", "openai", "google"
+	InputCostPerM  float64 `json:"input_cost_per_m"`  // cost per 1M input tokens
+	OutputCostPerM float64 `json:"output_cost_per_m"` // cost per 1M output tokens
 }
 
 // ============================================================
-// ROUTING
+// PLANS — the bridge between planner and executor agents
 // ============================================================
 
-type RoutingMode string
-
-const (
-	ModeSkillExecute    RoutingMode = "skill_execute"
-	ModeMemoryApply     RoutingMode = "memory_apply"
-	ModePlanExecute     RoutingMode = "plan_execute"
-	ModeFullOrchestration RoutingMode = "full_orchestration"
-	ModeSingleOpus      RoutingMode = "single_opus"
-	ModeSingleHaiku     RoutingMode = "single_haiku"
-)
-
-type RoutingDecision struct {
-	Mode           RoutingMode `json:"mode"`
-	// Role-based fields — the agent maps these to its configured models.
-	// Values: "premium", "low_cost", or "automated" (for verify tier 1).
-	PlannerRole    string      `json:"planner_role"`
-	ExecutorRole   string      `json:"executor_role"`
-	VerifierRole   string      `json:"verifier_role"`
-	// NextStep tells the agent what to do first.
-	// Values: "plan", "execute", "verify", "direct", "skill_execute", "memory_apply"
-	NextStep       string      `json:"next_step"`
-	VerifyTier     VerifyTier  `json:"verify_tier"`
-	SkipPlanning   bool        `json:"skip_planning"`
-	MatchedSkillID string      `json:"matched_skill_id,omitempty"`
-	MemoryHit      bool        `json:"memory_hit"`
-	TemplateID     string      `json:"template_id,omitempty"`
-	Reason         string      `json:"reason"`
-}
-
-type VerifyTier int
-
-const (
-	VerifyAutomated  VerifyTier = 1
-	VerifySpotCheck  VerifyTier = 2
-	VerifyFullReview VerifyTier = 3
-)
-
-// ============================================================
-// TASK
-// ============================================================
-
-type Task struct {
-	ID           string    `json:"id"`
-	DeveloperID  string    `json:"developer_id"`
-	RepoID       string    `json:"repo_id"`
-	Prompt       string    `json:"prompt"`
-	GraphNodeIDs []string  `json:"graph_node_ids"`
-	TaskType     TaskType  `json:"task_type"`
-	CreatedAt    time.Time `json:"created_at"`
-}
-
-type TaskType string
-
-const (
-	TaskCodeFix      TaskType = "code_fix"
-	TaskTestGen      TaskType = "test_gen"
-	TaskPRGen        TaskType = "pr_gen"
-	TaskRefactor     TaskType = "refactor"
-	TaskDepUpdate    TaskType = "dependency_update"
-	TaskConfigChange TaskType = "config_change"
-	TaskMigration    TaskType = "migration"
-	TaskAnalysis     TaskType = "analysis"
-	TaskExplanation  TaskType = "explanation"
-	TaskGeneral      TaskType = "general"
-)
-
-// ============================================================
-// PLAN
-// ============================================================
-
+// Plan is a task specification created by the planner agent (premium model).
+// Stored in PostgreSQL. Retrieved by the executor agent (cheap model).
 type Plan struct {
-	TaskID   string    `json:"task_id"`
-	SubTasks []SubTask `json:"sub_tasks"`
-	PRTitle  string    `json:"pr_title,omitempty"`
-	PRBody   string    `json:"pr_body,omitempty"`
-	TestCmd  string    `json:"test_command,omitempty"`
+	ID               string     `json:"id"`
+	DeveloperID      string     `json:"developer_id"`
+	Title            string     `json:"title"`
+	TaskPrompt       string     `json:"task_prompt"`
+	Steps            []string   `json:"steps"`
+	FilesToChange    []string   `json:"files_to_change,omitempty"`
+	SkillUsed        string     `json:"skill_used,omitempty"`
+	SkillVerified    bool       `json:"skill_verified"`
+	GraphContext     string     `json:"graph_context,omitempty"`
+	AffectedNodes    []string   `json:"affected_nodes,omitempty"`
+	CrossRepo        bool       `json:"cross_repo"`
+	RiskLevel        string     `json:"risk_level,omitempty"`
+	PlannerModel     string     `json:"planner_model,omitempty"`
+	ExecutorModel    string     `json:"executor_model,omitempty"`
+	Status           PlanStatus `json:"status"`
+	ResultSuccess    *bool      `json:"result_success,omitempty"`
+	ResultSummary    string     `json:"result_summary,omitempty"`
+	ResultFiles      []string   `json:"result_files,omitempty"`
+	ResultTests      *bool      `json:"result_tests,omitempty"`
+	ResultError      string     `json:"result_error,omitempty"`
+	Verified         *bool      `json:"verified,omitempty"`
+	VerificationNote string     `json:"verification_note,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	ExecutedAt       *time.Time `json:"executed_at,omitempty"`
+	VerifiedAt       *time.Time `json:"verified_at,omitempty"`
 }
 
-type SubTask struct {
-	ID         string      `json:"id"`
-	Action     string      `json:"action"`
-	DependsOn  []string    `json:"depends_on"`
-	Spec       interface{} `json:"spec"`
-	VerifyTier VerifyTier  `json:"verify_tier"`
-}
+type PlanStatus string
 
-type SubTaskResult struct {
-	SubTaskID    string    `json:"sub_task_id"`
-	Success      bool      `json:"success"`
-	Output       string    `json:"output"`
-	ErrorMessage string    `json:"error,omitempty"`
-	TokensUsed   int       `json:"tokens_used"`
-	LatencyMs    int       `json:"latency_ms"`
-	Model        ModelTier `json:"model"`
-}
+const (
+	PlanPending   PlanStatus = "pending"
+	PlanExecuting PlanStatus = "executing"
+	PlanCompleted PlanStatus = "completed"
+	PlanFailed    PlanStatus = "failed"
+	PlanVerified  PlanStatus = "verified"
+	PlanRejected  PlanStatus = "rejected"
+)
 
-// ============================================================
-// ESCALATION
-// ============================================================
-
-type EscalationStep struct {
-	Step    int    `json:"step"`
-	Action  string `json:"action"`
-	Error   string `json:"error"`
-	Success bool   `json:"success"`
+// PlanSummary is the compact version for listing plans.
+type PlanSummary struct {
+	ID            string     `json:"id"`
+	Title         string     `json:"title"`
+	Status        PlanStatus `json:"status"`
+	StepCount     int        `json:"step_count"`
+	SkillUsed     bool       `json:"skill_used"`
+	CrossRepo     bool       `json:"cross_repo"`
+	PlannerModel  string     `json:"planner_model"`
+	ExecutorModel string     `json:"executor_model"`
+	CreatedAt     time.Time  `json:"created_at"`
 }
 
 // ============================================================
 // COST TRACKING
 // ============================================================
 
-type CostRecord struct {
-	ID              string      `json:"id"`
-	TaskID          string      `json:"task_id"`
-	DeveloperID     string      `json:"developer_id"`
-	Model           ModelTier   `json:"model"`
-	InputTokens     int         `json:"input_tokens"`
-	OutputTokens    int         `json:"output_tokens"`
-	CostUSD         float64     `json:"cost_usd"`
-	Phase           string      `json:"phase"`
-	RoutingMode     RoutingMode `json:"routing_mode"`
-	SkillID         string      `json:"skill_id,omitempty"`
-	MemoryHit       bool        `json:"memory_hit"`
-	EscalationSteps int         `json:"escalation_steps"`
-	WasTakeover     bool        `json:"was_takeover"`
-	LatencyMs       int         `json:"latency_ms"`
-	RepoID          string      `json:"repo_id"`
+// PlanCost tracks the estimated cost of a plan execution.
+// These are ESTIMATES based on the developer's configured model pricing.
+// Universe doesn't see actual Cursor token counts.
+type PlanCost struct {
+	ID                      string  `json:"id"`
+	PlanID                  string  `json:"plan_id"`
+	DeveloperID             string  `json:"developer_id"`
+	PlannerModel            string  `json:"planner_model"`
+	ExecutorModel           string  `json:"executor_model"`
+	EstimatedPlannerTokens  int     `json:"estimated_planner_tokens"`
+	EstimatedExecutorTokens int     `json:"estimated_executor_tokens"`
+	EstimatedPlannerCost    float64 `json:"estimated_planner_cost"`
+	EstimatedExecutorCost   float64 `json:"estimated_executor_cost"`
+	EstimatedTotalCost      float64 `json:"estimated_total_cost"`
+	EstimatedAllPremiumCost float64 `json:"estimated_all_premium_cost"`
+	EstimatedSavings        float64 `json:"estimated_savings"`
+	SkillUsed               bool    `json:"skill_used"`
+	MemoryHit               bool    `json:"memory_hit"`
+	RoutingRecommendation   string  `json:"routing_recommendation"`
 }
 
 // ============================================================
-// TASK RESULT
+// ROUTING — recommendation, not decision
 // ============================================================
 
-type TaskResult struct {
-	TaskID      string             `json:"task_id"`
-	Success     bool               `json:"success"`
-	Output      string             `json:"output"`
-	RoutingMode RoutingMode        `json:"routing_mode"`
-	TotalCost   float64            `json:"total_cost_usd"`
-	TotalTokens int                `json:"total_tokens"`
-	LatencyMs   int                `json:"latency_ms"`
-	SubResults  []SubTaskResult    `json:"sub_results,omitempty"`
-	Escalations []EscalationRecord `json:"escalations,omitempty"`
-	SkillUsed   string             `json:"skill_used,omitempty"`
-	MemoryHit   bool               `json:"memory_hit"`
+// RoutingRecommendation is what the router suggests to the planner.
+// The planner (premium model in Cursor) reads this and decides what to do.
+// Universe doesn't enforce routing — it just provides information.
+type RoutingRecommendation struct {
+	SkillAvailable    bool    `json:"skill_available"`
+	SkillID           string  `json:"skill_id,omitempty"`
+	SkillName         string  `json:"skill_name,omitempty"`
+	SkillConfidence   float64 `json:"skill_confidence,omitempty"`
+	MemoryAvailable   bool    `json:"memory_available"`
+	MemoryCount       int     `json:"memory_count,omitempty"`
+	AffectedNodeCount int     `json:"affected_node_count"`
+	CrossRepo         bool    `json:"cross_repo"`
+	RiskLevel         string  `json:"risk_level"` // "low", "medium", "high"
+	Recommendation    string  `json:"recommendation"`
 }
 
 // ============================================================
@@ -180,58 +124,36 @@ type TaskResult struct {
 // ============================================================
 
 type Config struct {
-	OpusConfig  ModelConfig
-	HaikuConfig ModelConfig
-
-	SkillMatchMinSuccessRate  float64
-	MemoryMatchMinConfidence  float64
-	SimpleTaskMaxNodes        int
-	MinTaskSizeForSplit       int
-
-	MaxHaikuRetries           int
-	MaxTotalAttempts          int
-
-	AsyncVerifyForInteractive bool
-
-	MaxParallelHaikuCalls int
-
-	OpusCallsPerMinute  int
-	HaikuCallsPerMinute int
-	RetryBackoffBase    int
-
 	DatabaseURL string
+
+	// Developer's model preferences (from universe config)
+	PremiumModel   ModelConfig
+	ExecutionModel ModelConfig
+
+	// Auto-open executor workspace after store_plan?
+	AutoOpenExecutor bool // default: true
+
+	// Workspace file paths
+	PlannerWorkspacePath  string // default: ".universe/workspaces/planner.code-workspace"
+	ExecutorWorkspacePath string // default: ".universe/workspaces/executor.code-workspace"
 }
 
 func DefaultConfig() Config {
 	return Config{
-		OpusConfig: ModelConfig{
-			Tier:           Opus,
-			ModelID:        "claude-opus-4-20250514",
-			Endpoint:       "https://api.anthropic.com/v1/messages",
-			MaxTokens:      4096,
+		PremiumModel: ModelConfig{
+			Name:           "claude-opus-4",
+			Provider:       "anthropic",
 			InputCostPerM:  15.0,
 			OutputCostPerM: 75.0,
-			MaxConcurrent:  3,
 		},
-		HaikuConfig: ModelConfig{
-			Tier:           Haiku,
-			ModelID:        "claude-haiku-4-5-20251001",
-			Endpoint:       "https://api.anthropic.com/v1/messages",
-			MaxTokens:      4096,
+		ExecutionModel: ModelConfig{
+			Name:           "claude-haiku-3.5",
+			Provider:       "anthropic",
 			InputCostPerM:  0.25,
 			OutputCostPerM: 1.25,
-			MaxConcurrent:  10,
 		},
-		SkillMatchMinSuccessRate:  0.85,
-		MemoryMatchMinConfidence:  0.80,
-		SimpleTaskMaxNodes:        3,
-		MinTaskSizeForSplit:       300,
-		MaxHaikuRetries:           2,
-		MaxTotalAttempts:          3,
-		AsyncVerifyForInteractive: true,
-		MaxParallelHaikuCalls:     5,
-		OpusCallsPerMinute:        30,
-		HaikuCallsPerMinute:       100,
-		RetryBackoffBase:          1000,
+		AutoOpenExecutor:      true,
+		PlannerWorkspacePath:  ".universe/workspaces/planner.code-workspace",
+		ExecutorWorkspacePath: ".universe/workspaces/executor.code-workspace",
 	}
 }

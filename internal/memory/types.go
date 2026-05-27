@@ -130,10 +130,9 @@ type MemoryStats struct {
 	ByCategory        map[string]int `json:"by_category"`
 	ByRepo            map[string]int `json:"by_repo"`
 	AverageConfidence float64        `json:"average_confidence"`
-	OldestObservation time.Time      `json:"oldest_observation"`
-	NewestObservation time.Time      `json:"newest_observation"`
+	OldestObservation *time.Time     `json:"oldest_observation,omitempty"`
+	NewestObservation *time.Time     `json:"newest_observation,omitempty"`
 	TotalRecalls      int            `json:"total_recalls"`
-	SharedObservations int           `json:"shared_observations"`
 }
 
 // DecayResult is returned by DecayRunner.RunDecay.

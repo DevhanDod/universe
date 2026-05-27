@@ -232,6 +232,72 @@ type RoutingFilters struct {
 	Limit       int
 }
 
+// ── Plans ─────────────────────────────────────────────────────────────────────
+
+type PlanRow struct {
+	ID            string     `json:"id"`
+	DeveloperID   string     `json:"developer_id"`
+	Title         string     `json:"title"`
+	Status        string     `json:"status"`
+	StepCount     int        `json:"step_count"`
+	SkillUsed     bool       `json:"skill_used"`
+	SkillVerified bool       `json:"skill_verified"`
+	CrossRepo     bool       `json:"cross_repo"`
+	RiskLevel     string     `json:"risk_level"`
+	PlannerModel  string     `json:"planner_model"`
+	ExecutorModel string     `json:"executor_model"`
+	ResultSuccess *bool      `json:"result_success,omitempty"`
+	ResultTests   *bool      `json:"result_tests,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	ExecutedAt    *time.Time `json:"executed_at,omitempty"`
+	VerifiedAt    *time.Time `json:"verified_at,omitempty"`
+}
+
+type PlanDetail struct {
+	PlanRow
+	TaskPrompt       string   `json:"task_prompt"`
+	Steps            []string `json:"steps"`
+	FilesToChange    []string `json:"files_to_change"`
+	GraphContext     string   `json:"graph_context"`
+	AffectedNodes    []string `json:"affected_nodes"`
+	ResultSummary    string   `json:"result_summary"`
+	ResultFiles      []string `json:"result_files"`
+	ResultError      string   `json:"result_error"`
+	VerificationNote string   `json:"verification_note"`
+	EstimatedCost    float64  `json:"estimated_cost"`
+	AllPremiumCost   float64  `json:"all_premium_cost"`
+	EstimatedSavings float64  `json:"estimated_savings"`
+}
+
+type PlanStatsResponse struct {
+	TotalPlans      int     `json:"total_plans"`
+	Completed       int     `json:"completed"`
+	Failed          int     `json:"failed"`
+	Verified        int     `json:"verified"`
+	Rejected        int     `json:"rejected"`
+	Pending         int     `json:"pending"`
+	CompletionRate  float64 `json:"completion_rate"`
+	VerificationRate float64 `json:"verification_rate"`
+	AvgStepsPerPlan float64 `json:"avg_steps_per_plan"`
+	SkillUsedCount  int     `json:"skill_used_count"`
+	CrossRepoCount  int     `json:"cross_repo_count"`
+}
+
+type PlanListResponse struct {
+	Plans  []PlanRow `json:"plans"`
+	Total  int       `json:"total"`
+	Page   int       `json:"page"`
+	Limit  int       `json:"limit"`
+	Stats  PlanStatsResponse `json:"stats"`
+}
+
+type PlanFilters struct {
+	DeveloperID string
+	Status      string
+	Page        int
+	Limit       int
+}
+
 // ── Graph ─────────────────────────────────────────────────────────────────────
 
 type GraphNodeRow struct {

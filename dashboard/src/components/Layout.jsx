@@ -4,10 +4,11 @@ import { useState, useEffect } from 'react';
 const NAV_LINKS = [
   { to: '/',            label: 'Overview',    icon: '◈' },
   { to: '/graph',       label: 'Graph',       icon: '⬡' },
-  { to: '/memory',      label: 'Memory',      icon: '◎' },
+  { to: '/memory',      label: 'Your Memory', icon: '◎' },
   { to: '/skills',      label: 'Skills',      icon: '◆' },
+  { to: '/plans',       label: 'Plans',       icon: '▤' },
   { to: '/compression', label: 'Compression', icon: '⊞' },
-  { to: '/routing',     label: 'Routing',     icon: '⇢' },
+  { to: '/activity',    label: 'Activity',    icon: '⇢' },
 ];
 
 function statusClass(status) {

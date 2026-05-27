@@ -138,7 +138,7 @@ func (s *Store) GetByGraphNode(graphNodeID string, developerID string, limit int
 		SELECT id, graph_node_id, category, summary, confidence, created_at
 		FROM observations
 		WHERE graph_node_id = $1
-		  AND (shared = true OR developer_id = $2)
+		  AND developer_id = $2
 		  AND confidence > 0.1
 		ORDER BY confidence DESC, created_at DESC
 		LIMIT $3`, graphNodeID, developerID, limit)
@@ -155,7 +155,7 @@ func (s *Store) GetByGraphNodes(graphNodeIDs []string, developerID string, limit
 		SELECT id, graph_node_id, category, summary, confidence, created_at
 		FROM observations
 		WHERE graph_node_id = ANY($1)
-		  AND (shared = true OR developer_id = $2)
+		  AND developer_id = $2
 		  AND confidence > 0.1
 		ORDER BY confidence DESC, created_at DESC
 		LIMIT $3`, graphNodeIDs, developerID, limit)
@@ -173,7 +173,7 @@ func (s *Store) SearchKeyword(query string, developerID string, limit int) ([]Ob
 		       ts_rank(fts, plainto_tsquery('english', $1)) AS score
 		FROM observations
 		WHERE fts @@ plainto_tsquery('english', $1)
-		  AND (shared = true OR developer_id = $2)
+		  AND developer_id = $2
 		  AND confidence > 0.1
 		ORDER BY score DESC
 		LIMIT $3`, query, developerID, limit)
@@ -191,7 +191,7 @@ func (s *Store) SearchSemantic(queryEmbedding []float32, developerID string, lim
 		SELECT id, graph_node_id, category, summary, confidence, created_at,
 		       1 - (embedding <=> $1) AS score
 		FROM observations
-		WHERE (shared = true OR developer_id = $2)
+		WHERE developer_id = $2
 		  AND confidence > 0.1
 		  AND embedding IS NOT NULL
 		ORDER BY embedding <=> $1
@@ -262,8 +262,7 @@ func (s *Store) GetStats() (*MemoryStats, error) {
 			COALESCE(AVG(confidence), 0),
 			MIN(created_at),
 			MAX(created_at),
-			COUNT(*) FILTER (WHERE recalled_at IS NOT NULL),
-			COUNT(*) FILTER (WHERE shared = true)
+			COUNT(*) FILTER (WHERE recalled_at IS NOT NULL)
 		FROM observations`)
 	if err := row.Scan(
 		&stats.TotalObservations,
@@ -271,7 +270,6 @@ func (s *Store) GetStats() (*MemoryStats, error) {
 		&stats.OldestObservation,
 		&stats.NewestObservation,
 		&stats.TotalRecalls,
-		&stats.SharedObservations,
 	); err != nil {
 		return nil, fmt.Errorf("get stats: %w", err)
 	}

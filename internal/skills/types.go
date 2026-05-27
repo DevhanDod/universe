@@ -82,6 +82,12 @@ type SkillSummary struct {
 	TimesApplied        int               `json:"times_applied"`
 	NegativeTags        []NegativeTag     `json:"negative_tags,omitempty"`
 	SuccessByComplexity ComplexityMetrics `json:"success_by_complexity"`
+
+	// Verification fields — always set by Matcher.Match.
+	// The planning agent (premium model) must verify the skill before the
+	// execution agent uses it. Skills are reference knowledge, not auto-applied.
+	RequiresVerification bool   `json:"requires_verification"`
+	VerificationPrompt   string `json:"verification_prompt,omitempty"`
 }
 
 // SkillExecution logs one application of a skill.
@@ -116,6 +122,11 @@ type MatchResult struct {
 	Candidates           []SkillSummary `json:"candidates"`
 	ExplorationTriggered bool           `json:"exploration_triggered"`
 	SearchMethod         string         `json:"search_method"`
+
+	// VerificationRequired is always true when a skill is found.
+	// The planning agent must review the skill before the execution agent uses it.
+	VerificationRequired bool   `json:"verification_required"`
+	VerificationMessage  string `json:"verification_message,omitempty"`
 }
 
 // EvolutionRequest is sent to the evolver after a task completes.
@@ -214,8 +225,8 @@ func DefaultConfig() Config {
 		EmbeddingModel:             "text-embedding-ada-002",
 		OpusModel:                  "claude-opus-4-20250514",
 		OpusEndpoint:               "https://api.anthropic.com/v1/messages",
-		MinConfidenceForMatch:      0.5,
-		MinSuccessRateForMatch:     0.60,
+		MinConfidenceForMatch:      0.3,  // lower — premium model verifies before use
+		MinSuccessRateForMatch:     0.40, // lower — let premium model see more options
 		MinGraphOverlapForMatch:    0.3,
 		SimilarityThresholdForSkip: 0.85,
 		MaxSkillsPerGraphNode:      5,

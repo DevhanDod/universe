@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: universe_postgres
+    environment:
+      POSTGRES_USER: universe_admin
+      POSTGRES_PASSWORD: universe_secret_2024
+      POSTGRES_DB: universe
+    ports:
+      - "5433:5432"
+    volumes:
+      - universe_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U universe_admin -d universe"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  universe_pgdata:

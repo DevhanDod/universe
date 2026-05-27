@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -11,21 +12,22 @@ import (
 // ============================================================
 
 type GetCostSummaryInput struct {
-	Period      string `json:"period,omitempty" jsonschema:"description=Time period: week month all (default month)"`
-	DeveloperID string `json:"developer_id,omitempty" jsonschema:"description=Filter by developer. Empty for team-wide."`
+	Period      string `json:"period,omitempty"`
+	DeveloperID string `json:"developer_id,omitempty"`
 }
 
 type GetCostSummaryOutput struct {
-	ActualCost       float64        `json:"actual_cost"`
-	WouldHaveCost    float64        `json:"would_have_cost"`
-	SavingsUSD       float64        `json:"savings_usd"`
-	SavingsPercent   float64        `json:"savings_percent"`
-	TotalTasks       int            `json:"total_tasks"`
-	SkillUses        int            `json:"skill_uses"`
-	MemoryHits       int            `json:"memory_hits"`
-	Takeovers        int            `json:"takeovers"`
-	RoutingBreakdown map[string]int `json:"routing_breakdown"`
-	Message          string         `json:"message,omitempty"`
+	ActualCost     float64 `json:"actual_cost"`
+	WouldHaveCost  float64 `json:"would_have_cost"`
+	SavingsUSD     float64 `json:"savings_usd"`
+	SavingsPercent float64 `json:"savings_percent"`
+	TotalPlans     int     `json:"total_plans"`
+	SkillUses      int     `json:"skill_uses"`
+	MemoryHits     int     `json:"memory_hits"`
+	AvgCostPerPlan float64 `json:"avg_cost_per_plan"`
+	PremiumModel   string  `json:"premium_model,omitempty"`
+	ExecutionModel string  `json:"execution_model,omitempty"`
+	Message        string  `json:"message,omitempty"`
 }
 
 func (h *Handlers) HandleGetCostSummary(
@@ -33,45 +35,47 @@ func (h *Handlers) HandleGetCostSummary(
 	req *mcp.CallToolRequest,
 	input GetCostSummaryInput,
 ) (*mcp.CallToolResult, GetCostSummaryOutput, error) {
-	if h.orchestrator == nil {
+	if h.tracker == nil {
 		return nil, GetCostSummaryOutput{
-			Message: "Orchestrator not available. Cost tracking requires DATABASE_URL.",
+			Message: "Cost tracker not available. Connect a database: universe config set db postgres://...",
 		}, nil
 	}
 
-	summaries, err := h.orchestrator.Tracker().GetMonthlySummary()
+	summaries, err := h.tracker.GetMonthlySummary()
 	if err != nil {
 		return nil, GetCostSummaryOutput{}, err
 	}
 
 	if len(summaries) == 0 {
 		return nil, GetCostSummaryOutput{
-			Message: "No cost data yet. Run tasks through the orchestrator first.",
+			Message: "No cost data yet. Run tasks through the plan bridge first.",
 		}, nil
 	}
 
-	// Use the most recent month
 	s := summaries[len(summaries)-1]
 	pct := 0.0
 	if s.WouldHaveCost > 0 {
-		pct = (s.SavingsUSD / s.WouldHaveCost) * 100
+		pct = s.Savings / s.WouldHaveCost * 100
+	}
+
+	premiumModel := ""
+	executionModel := ""
+	if h.orchConfig != nil {
+		premiumModel = h.orchConfig.PremiumModel.Name
+		executionModel = h.orchConfig.ExecutionModel.Name
 	}
 
 	return nil, GetCostSummaryOutput{
 		ActualCost:     s.ActualCost,
 		WouldHaveCost:  s.WouldHaveCost,
-		SavingsUSD:     s.SavingsUSD,
+		SavingsUSD:     s.Savings,
 		SavingsPercent: pct,
-		TotalTasks:     s.TotalCalls,
-		SkillUses:      s.SkillExecutions,
-		MemoryHits:     s.MemoryApplies,
-		Takeovers:      s.Takeovers,
-		RoutingBreakdown: map[string]int{
-			"skill_execute":      s.SkillExecutions,
-			"memory_apply":       s.MemoryApplies,
-			"plan_execute":       s.PlanExecutes,
-			"full_orchestration": s.FullOrchestrations,
-			"single_opus":        s.TotalCalls - s.SkillExecutions - s.MemoryApplies - s.PlanExecutes - s.FullOrchestrations,
-		},
+		TotalPlans:     s.TotalPlans,
+		SkillUses:      s.SkillUses,
+		MemoryHits:     s.MemoryHits,
+		AvgCostPerPlan: s.AvgCostPerPlan,
+		PremiumModel:   premiumModel,
+		ExecutionModel: executionModel,
+		Message:        fmt.Sprintf("This month: %d plans, $%.4f actual vs $%.4f without routing (%.1f%% saved).", s.TotalPlans, s.ActualCost, s.WouldHaveCost, pct),
 	}, nil
 }

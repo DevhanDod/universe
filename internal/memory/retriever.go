@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -40,7 +41,11 @@ type scoredObs struct {
 }
 
 // Search performs the full 3-way hybrid search.
+// query.DeveloperID is required — memory is personal and scoped per developer.
 func (r *Retriever) Search(query SearchQuery) (*SearchResult, error) {
+	if query.DeveloperID == "" {
+		return nil, fmt.Errorf("DeveloperID is required — memory is personal")
+	}
 	if query.Limit <= 0 {
 		query.Limit = r.config.DefaultSearchLimit
 	}
