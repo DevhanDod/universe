@@ -10,6 +10,13 @@ universe
 /bin/
 /dist/
 
+# npm binary (downloaded by postinstall, not committed)
+npm/bin/universe
+npm/bin/universe.exe
+
+# Keep the npm wrapper script
+!npm/bin/wrapper.js
+
 # Go test cache
 *.test
 *.out

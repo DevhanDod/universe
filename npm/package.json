@@ -1,25 +1,42 @@
 {
-  "name": "@atlas/universe",
+  "name": "@devhand/universe",
   "version": "0.1.0",
   "description": "Universe — AI token optimization platform for Cursor with 5 engines: Knowledge Graph, Persistent Memory, Self-Evolving Skills, Compression, and Plan-Bridge",
-  "keywords": ["cursor", "ai", "mcp", "token-optimization", "llm"],
+  "keywords": [
+    "cursor",
+    "ai",
+    "mcp",
+    "token-optimization",
+    "llm"
+  ],
   "homepage": "https://github.com/Universe/universe",
   "license": "MIT",
   "bin": {
-    "universe": "./scripts/run.js"
+    "universe": "./bin/wrapper.js"
   },
   "files": [
-    "bin/",
-    "scripts/",
+    "bin/wrapper.js",
+    "scripts/postinstall.js",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "postinstall": "node scripts/install.js"
+    "postinstall": "node scripts/postinstall.js",
+    "prepare": "node -e \"try{require('fs').chmodSync('bin/wrapper.js',0o755)}catch(e){}\""
   },
   "engines": {
     "node": ">=16"
   },
-  "os": ["linux", "darwin", "win32"],
-  "cpu": ["x64", "arm64"]
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
 }
