@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const GITHUB_OWNER = 'Universe';
+const GITHUB_OWNER = 'DevhanDod';
 const GITHUB_REPO  = 'universe';
 
 const pkg = require('../package.json');
