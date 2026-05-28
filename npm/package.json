@@ -7,7 +7,9 @@
     "ai",
     "mcp",
     "token-optimization",
-    "llm"
+    "llm",
+    "developer-tools",
+    "knowledge-graph"
   ],
   "homepage": "https://github.com/DevhanDod/universe",
   "repository": {

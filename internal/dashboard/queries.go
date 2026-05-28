@@ -265,8 +265,8 @@ func QuerySkills(db *pgxpool.Pool, f SkillFilters) (*SkillListResponse, error) {
 	}
 
 	rows, err := db.Query(context.Background(), fmt.Sprintf(`
-		SELECT id, name, version, evolution, COALESCE(language, ''), trigger_desc,
-		       graph_node_ids,
+		SELECT id, name, version, evolution, COALESCE(language, ''), COALESCE(trigger_desc, ''),
+		       COALESCE(graph_node_ids, ARRAY[]::text[]),
 		       confidence,
 		       CASE WHEN times_applied > 0
 		         THEN times_succeeded::float / times_applied
@@ -341,8 +341,8 @@ func QuerySkillDetail(db *pgxpool.Pool, id string) (*SkillDetail, error) {
 	var testCaseJSON []byte
 	err := db.QueryRow(context.Background(), `
 		SELECT id, name, version, COALESCE(parent_id::text, ''), evolution,
-		       COALESCE(language, ''), trigger_desc, instruction,
-		       graph_node_ids, confidence,
+		       COALESCE(language, ''), COALESCE(trigger_desc, ''), COALESCE(instruction, ''),
+		       COALESCE(graph_node_ids, ARRAY[]::text[]), confidence,
 		       CASE WHEN times_applied > 0 THEN times_succeeded::float/times_applied ELSE 0 END,
 		       times_applied, times_succeeded, is_frozen,
 		       created_at, COALESCE(created_by, ''),
@@ -761,8 +761,8 @@ func QueryGraphNodeDetail(db *pgxpool.Pool, g *graph.Graph, nodeID string) (*Gra
 		}
 
 		sRows, _ := db.Query(context.Background(), `
-			SELECT id, name, version, evolution, COALESCE(language, ''), trigger_desc,
-			       graph_node_ids, confidence,
+			SELECT id, name, version, evolution, COALESCE(language, ''), COALESCE(trigger_desc, ''),
+			       COALESCE(graph_node_ids, ARRAY[]::text[]), confidence,
 			       CASE WHEN times_applied > 0 THEN times_succeeded::float/times_applied ELSE 0 END,
 			       times_applied, times_succeeded, is_frozen, created_at, COALESCE(created_by, '')
 			FROM skills WHERE $1 = ANY(graph_node_ids) AND is_active = true

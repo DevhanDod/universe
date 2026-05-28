@@ -20,15 +20,17 @@ var staticFiles embed.FS
 
 // Server is the dashboard HTTP server.
 type Server struct {
-	db     *pgxpool.Pool
-	graph  *graph.Graph
-	port   int
-	srv    *http.Server
+	db         *pgxpool.Pool
+	graph      *graph.Graph
+	projectDir string
+	port       int
+	srv        *http.Server
 }
 
 // NewServer creates a dashboard server. db and g may be nil (graceful degradation).
-func NewServer(databaseURL string, port int, g *graph.Graph) (*Server, error) {
-	s := &Server{port: port, graph: g}
+// projectDir is the path to the project root (where .universe/graph.json lives).
+func NewServer(databaseURL string, port int, projectDir string, g *graph.Graph) (*Server, error) {
+	s := &Server{port: port, graph: g, projectDir: projectDir}
 
 	if databaseURL != "" {
 		pool, err := pgxpool.New(context.Background(), databaseURL)

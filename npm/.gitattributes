@@ -1,0 +1,3 @@
+# Force Unix line endings for scripts that npm runs
+bin/wrapper.js text eol=lf
+scripts/postinstall.js text eol=lf
