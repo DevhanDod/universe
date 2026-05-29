@@ -2,7 +2,7 @@ import './styles.css';
 import { Routes, Route } from 'react-router-dom';
 import Layout from './components/Layout.jsx';
 import Overview from './pages/Overview.jsx';
-import Graph from './pages/Graph.jsx';
+import GraphView from './pages/GraphView.jsx';
 import Memory from './pages/Memory.jsx';
 import Skills from './pages/Skills.jsx';
 import Plans from './pages/Plans.jsx';
@@ -14,7 +14,7 @@ export default function App() {
     <Routes>
       <Route element={<Layout />}>
         <Route path="/"            element={<Overview />} />
-        <Route path="/graph"       element={<Graph />} />
+        <Route path="/graph"       element={<GraphView />} />
         <Route path="/memory"      element={<Memory />} />
         <Route path="/skills"      element={<Skills />} />
         <Route path="/plans"       element={<Plans />} />
