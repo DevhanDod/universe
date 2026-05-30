@@ -42,7 +42,10 @@ func (g *GoParser) Parse(filePath string, content []byte) (*models.ParseResult, 
 	fileName := filepath.Base(filePath)
 	testFile := strings.HasSuffix(fileName, "_test.go")
 
-	file, err := parser.ParseFile(fset, filePath, content, parser.AllErrors)
+	// ParseComments is required for Doc/Comment fields to be populated —
+	// without it gd.Doc, fd.Doc, field.Comment, file.Doc, file.Comments are
+	// all nil and every comment-extraction codepath silently produces nothing.
+	file, err := parser.ParseFile(fset, filePath, content, parser.AllErrors|parser.ParseComments)
 	if err != nil {
 		res.Errors = append(res.Errors, err.Error())
 	}
@@ -88,6 +91,19 @@ func (g *GoParser) Parse(filePath string, content []byte) (*models.ParseResult, 
 	}
 	if testFile {
 		fileMeta["is_test"] = "true"
+	}
+	// File-level package doc + tally of all comments (counts, TODOs, FIXMEs).
+	if file.Doc != nil {
+		if pd := strings.TrimSpace(file.Doc.Text()); pd != "" {
+			fileMeta["package_doc"] = pd
+		}
+	}
+	commentCount, todoLines := summarizeGoComments(fset, file.Comments)
+	if commentCount > 0 {
+		fileMeta["comment_count"] = strconv.Itoa(commentCount)
+	}
+	if todoLines != "" {
+		fileMeta["todos"] = todoLines
 	}
 	res.Nodes = append(res.Nodes, models.Node{
 		ID:        fileNodeID,
@@ -203,6 +219,190 @@ func (g *GoParser) Parse(filePath string, content []byte) (*models.ParseResult, 
 				To:   id,
 				Type: models.EdgeContains,
 			})
+
+			// Struct field types are dependencies of the struct — emit one
+			// EdgeDependsOn per referenced type. Same-file resolution via
+			// typeIDs; cross-file/external bare names get resolved by the
+			// extractor in the same pass that handles function signatures.
+			// Field-level comments get folded into the struct node's metadata
+			// so they're never lost.
+			if st, ok := ts.Type.(*ast.StructType); ok && st.Fields != nil {
+				var fieldComments []string
+				for _, field := range st.Fields.List {
+					// collect field name(s) + comment for this struct's metadata
+					if field.Doc != nil || field.Comment != nil {
+						names := make([]string, 0, len(field.Names))
+						for _, fn := range field.Names {
+							names = append(names, fn.Name)
+						}
+						nameStr := strings.Join(names, ",")
+						if nameStr == "" {
+							nameStr = "<embedded>"
+						}
+						doc := ""
+						if field.Doc != nil {
+							doc = strings.TrimSpace(field.Doc.Text())
+						}
+						if field.Comment != nil {
+							if doc != "" {
+								doc += " | "
+							}
+							doc += strings.TrimSpace(field.Comment.Text())
+						}
+						if doc != "" {
+							fieldComments = append(fieldComments, nameStr+": "+doc)
+						}
+					}
+					for _, typeName := range goTypeRefs(field.Type) {
+						if typeName == "" || isBuiltinGoType(typeName) {
+							continue
+						}
+						toID := typeIDs[typeName]
+						if toID == "" {
+							toID = typeName
+						}
+						res.Edges = append(res.Edges, models.Edge{
+							From: id,
+							To:   toID,
+							Type: models.EdgeDependsOn,
+							Metadata: map[string]string{
+								"language": "go",
+								"scope":    "struct_field",
+								"resolved": fmt.Sprintf("%t", typeIDs[typeName] != ""),
+							},
+						})
+					}
+				}
+				if len(fieldComments) > 0 {
+					res.Nodes[len(res.Nodes)-1].Metadata["field_comments"] = strings.Join(fieldComments, "\n")
+				}
+			}
+			// Interface method comments — fold into the interface node's metadata.
+			if it, ok := ts.Type.(*ast.InterfaceType); ok && it.Methods != nil {
+				var methodComments []string
+				for _, m := range it.Methods.List {
+					if m.Doc == nil && m.Comment == nil {
+						continue
+					}
+					names := make([]string, 0, len(m.Names))
+					for _, mn := range m.Names {
+						names = append(names, mn.Name)
+					}
+					nameStr := strings.Join(names, ",")
+					if nameStr == "" {
+						nameStr = "<embedded>"
+					}
+					doc := ""
+					if m.Doc != nil {
+						doc = strings.TrimSpace(m.Doc.Text())
+					}
+					if m.Comment != nil {
+						if doc != "" {
+							doc += " | "
+						}
+						doc += strings.TrimSpace(m.Comment.Text())
+					}
+					if doc != "" {
+						methodComments = append(methodComments, nameStr+": "+doc)
+					}
+				}
+				if len(methodComments) > 0 {
+					res.Nodes[len(res.Nodes)-1].Metadata["method_comments"] = strings.Join(methodComments, "\n")
+				}
+			}
+		}
+	}
+
+	// Top-level vars and consts — emit one NodeVariable per declared name.
+	// Capture the value-type's name as a depends_on edge if it's a named type.
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || (gd.Tok != token.VAR && gd.Tok != token.CONST) {
+			continue
+		}
+		kind := "var"
+		if gd.Tok == token.CONST {
+			kind = "const"
+		}
+		// Group-level doc (the comment above `var (` or `const (`).
+		var groupDoc string
+		if gd.Doc != nil {
+			groupDoc = strings.TrimSpace(gd.Doc.Text())
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			// Per-spec doc (comment immediately above this var/const).
+			var specDoc string
+			if vs.Doc != nil {
+				specDoc = strings.TrimSpace(vs.Doc.Text())
+			}
+			var trailingComment string
+			if vs.Comment != nil {
+				trailingComment = strings.TrimSpace(vs.Comment.Text())
+			}
+			for _, ident := range vs.Names {
+				if ident.Name == "" || ident.Name == "_" {
+					continue
+				}
+				id := makeGoNodeID(pkgName, fileName, ident.Name)
+				m := map[string]string{"kind": kind}
+				if isGoExported(ident.Name) {
+					m["exported"] = "true"
+				}
+				if testFile {
+					m["is_test"] = "true"
+				}
+				if specDoc != "" {
+					m["doc_comment"] = specDoc
+				} else if groupDoc != "" {
+					m["doc_comment"] = groupDoc
+				}
+				if trailingComment != "" {
+					m["inline_comment"] = trailingComment
+				}
+				start := fset.Position(ident.Pos())
+				end := fset.Position(ident.End())
+				res.Nodes = append(res.Nodes, models.Node{
+					ID:        id,
+					Name:      ident.Name,
+					Type:      models.NodeVariable,
+					FilePath:  filePath,
+					Package:   pkgName,
+					StartLine: start.Line,
+					EndLine:   end.Line,
+					Metadata:  m,
+				})
+				res.Edges = append(res.Edges, models.Edge{
+					From: fileNodeID,
+					To:   id,
+					Type: models.EdgeContains,
+				})
+				// var x SomeType — dependency on SomeType.
+				if vs.Type != nil {
+					for _, typeName := range goTypeRefs(vs.Type) {
+						if typeName == "" || isBuiltinGoType(typeName) {
+							continue
+						}
+						toID := typeIDs[typeName]
+						if toID == "" {
+							toID = typeName
+						}
+						res.Edges = append(res.Edges, models.Edge{
+							From: id,
+							To:   toID,
+							Type: models.EdgeDependsOn,
+							Metadata: map[string]string{
+								"language": "go",
+								"scope":    kind,
+								"resolved": fmt.Sprintf("%t", typeIDs[typeName] != ""),
+							},
+						})
+					}
+				}
+			}
 		}
 	}
 
@@ -278,12 +478,228 @@ func (g *GoParser) Parse(filePath string, content []byte) (*models.ParseResult, 
 			}
 		}
 
+		// Function signature dependencies: param types → depends_on,
+		// return types → returns. Same-file resolution via typeIDs; the
+		// extractor resolves cross-file/external refs later.
+		recordGoSignatureEdges(res, fd.Type, id, pkgName, fileName, typeIDs)
+
 		if fd.Body != nil {
 			recordCallsAST(res, fd.Body, pkgName, fileName, id)
+			recordGoBodyTypeRefs(res, fd.Body, id, typeIDs)
 		}
 	}
 
 	return res, nil
+}
+
+// recordGoSignatureEdges adds edges from a function/method to every type used
+// in its parameter list (EdgeDependsOn) and result list (EdgeReturns).
+// Types from the same file resolve via typeIDs; unresolved bare names go out
+// with the raw type name as `To` so the extractor can resolve them later.
+func recordGoSignatureEdges(res *models.ParseResult, ft *ast.FuncType, fromID, pkgName, fileName string, typeIDs map[string]string) {
+	if ft == nil {
+		return
+	}
+	emit := func(typeName string, edgeType models.EdgeType) {
+		if typeName == "" || isBuiltinGoType(typeName) {
+			return
+		}
+		toID := typeIDs[typeName]
+		if toID == "" {
+			// leave as bare name for the extractor's resolver
+			toID = typeName
+		}
+		res.Edges = append(res.Edges, models.Edge{
+			From: fromID,
+			To:   toID,
+			Type: edgeType,
+			Metadata: map[string]string{
+				"language": "go",
+				"resolved": fmt.Sprintf("%t", typeIDs[typeName] != ""),
+			},
+		})
+	}
+	if ft.Params != nil {
+		for _, f := range ft.Params.List {
+			for _, name := range goTypeRefs(f.Type) {
+				emit(name, models.EdgeDependsOn)
+			}
+		}
+	}
+	if ft.Results != nil {
+		for _, f := range ft.Results.List {
+			for _, name := range goTypeRefs(f.Type) {
+				emit(name, models.EdgeReturns)
+			}
+		}
+	}
+}
+
+// goTypeRefs returns every distinct named type referenced inside a Go type
+// expression — drilling through pointers, slices, maps, channels, generics.
+// Qualified names like `pkg.Type` are returned as `Type` (the extractor's
+// cross-file resolver doesn't need the qualifier today).
+func goTypeRefs(expr ast.Expr) []string {
+	seen := map[string]struct{}{}
+	var walk func(ast.Expr)
+	walk = func(e ast.Expr) {
+		switch t := e.(type) {
+		case *ast.Ident:
+			seen[t.Name] = struct{}{}
+		case *ast.StarExpr:
+			walk(t.X)
+		case *ast.ArrayType:
+			walk(t.Elt)
+		case *ast.MapType:
+			walk(t.Key)
+			walk(t.Value)
+		case *ast.ChanType:
+			walk(t.Value)
+		case *ast.SelectorExpr:
+			// pkg.Type — keep just the type name (cross-pkg resolution TBD)
+			seen[t.Sel.Name] = struct{}{}
+		case *ast.IndexExpr: // generic: T[X]
+			walk(t.X)
+			walk(t.Index)
+		case *ast.IndexListExpr: // generic: T[X, Y]
+			walk(t.X)
+			for _, idx := range t.Indices {
+				walk(idx)
+			}
+		case *ast.Ellipsis: // ...T
+			walk(t.Elt)
+		case *ast.FuncType:
+			if t.Params != nil {
+				for _, f := range t.Params.List {
+					walk(f.Type)
+				}
+			}
+			if t.Results != nil {
+				for _, f := range t.Results.List {
+					walk(f.Type)
+				}
+			}
+		case *ast.InterfaceType, *ast.StructType:
+			// inline interface/struct — skip, not a referenced named type
+		}
+	}
+	walk(expr)
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	return out
+}
+
+// recordGoBodyTypeRefs walks a function body and emits an EdgeDependsOn from
+// the function to every named type referenced by:
+//   - composite literals: `MyStruct{…}`, `[]MyType{…}`, `map[K]V{…}`
+//   - type assertions:    `v.(MyType)`
+//   - type switches:      `switch v := x.(type) { case MyType: … }`
+//   - make / new builtins: `make([]MyType, n)`, `new(MyType)`
+//   - local var / short decl: `var x MyType`, declared via *ast.ValueSpec /
+//     *ast.AssignStmt where the LHS is a typed expression.
+//   - generic type args:  `Some[T]{}`, `Some[T, U]{}`
+//
+// Same-file resolution via typeIDs; cross-file/external bare names get
+// resolved later by the extractor's signature resolver (same path that
+// handles function-signature edges).
+func recordGoBodyTypeRefs(res *models.ParseResult, body ast.Node, fromID string, typeIDs map[string]string) {
+	seen := map[string]struct{}{}
+	emit := func(expr ast.Expr) {
+		if expr == nil {
+			return
+		}
+		for _, typeName := range goTypeRefs(expr) {
+			if typeName == "" || isBuiltinGoType(typeName) {
+				continue
+			}
+			if _, dup := seen[typeName]; dup {
+				continue
+			}
+			seen[typeName] = struct{}{}
+			toID := typeIDs[typeName]
+			if toID == "" {
+				toID = typeName
+			}
+			res.Edges = append(res.Edges, models.Edge{
+				From: fromID,
+				To:   toID,
+				Type: models.EdgeDependsOn,
+				Metadata: map[string]string{
+					"language": "go",
+					"scope":    "body",
+					"resolved": fmt.Sprintf("%t", typeIDs[typeName] != ""),
+				},
+			})
+		}
+	}
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.CompositeLit:
+			emit(x.Type)
+		case *ast.TypeAssertExpr:
+			emit(x.Type)
+		case *ast.TypeSwitchStmt:
+			// case bodies contribute via CaseClause below; nothing to emit here
+		case *ast.CaseClause:
+			for _, e := range x.List {
+				emit(e)
+			}
+		case *ast.ValueSpec:
+			// var x MyType
+			emit(x.Type)
+		case *ast.CallExpr:
+			// make(T, …), new(T) — type is the first arg
+			if ident, ok := x.Fun.(*ast.Ident); ok && (ident.Name == "make" || ident.Name == "new") && len(x.Args) > 0 {
+				emit(x.Args[0])
+			}
+		}
+		return true
+	})
+}
+
+// summarizeGoComments tallies every comment in the file (count) and extracts
+// any TODO/FIXME/HACK/XXX/BUG markers as "line: text" lines so they're visible
+// in the file node's metadata.
+func summarizeGoComments(fset *token.FileSet, groups []*ast.CommentGroup) (int, string) {
+	count := 0
+	var todos []string
+	for _, g := range groups {
+		if g == nil {
+			continue
+		}
+		for _, c := range g.List {
+			count++
+			text := strings.TrimLeft(c.Text, "/*")
+			text = strings.TrimRight(text, "*/")
+			text = strings.TrimSpace(text)
+			upper := strings.ToUpper(text)
+			if strings.HasPrefix(upper, "TODO") ||
+				strings.HasPrefix(upper, "FIXME") ||
+				strings.HasPrefix(upper, "HACK") ||
+				strings.HasPrefix(upper, "XXX") ||
+				strings.HasPrefix(upper, "BUG") {
+				line := fset.Position(c.Pos()).Line
+				todos = append(todos, fmt.Sprintf("%d: %s", line, text))
+			}
+		}
+	}
+	return count, strings.Join(todos, "\n")
+}
+
+// isBuiltinGoType skips edges to language built-ins so we don't drown the
+// graph in noise (every function returns `error`, takes `int`, etc.).
+func isBuiltinGoType(name string) bool {
+	switch name {
+	case "bool", "byte", "complex64", "complex128", "error", "float32", "float64",
+		"int", "int8", "int16", "int32", "int64", "rune", "string",
+		"uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+		"any", "comparable", "nil", "true", "false":
+		return true
+	}
+	return false
 }
 
 func lineCount(content []byte) int {

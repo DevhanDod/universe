@@ -83,6 +83,103 @@ func (e GoExtractor) Extract(result *models.ParseResult, allResults []*models.Pa
 		}
 	}
 
+	// Backfill pkgNodeByImportPath: the Go parser never sets `import_path` on
+	// package nodes, so the initial sweep populated nothing. Derive import
+	// paths from the import statements seen in *other* files — if file A
+	// imports "github.com/foo/internal/bar", and file B's directory is
+	// "internal/bar", then file B's package node is what that import points to.
+	dirToPkgNode := map[string]string{} // "internal/dashboard" -> pkg-node-ID
+	for _, pr := range combined {
+		if pr == nil || !languageIsGo(pr) {
+			continue
+		}
+		for _, n := range pr.Nodes {
+			if n.Type == models.NodePackage && n.FilePath == pr.FilePath {
+				dir := path.Dir(strings.ReplaceAll(n.FilePath, "\\", "/"))
+				if dir != "" && dir != "." {
+					if _, exists := dirToPkgNode[dir]; !exists {
+						dirToPkgNode[dir] = n.ID
+					}
+				}
+				break
+			}
+		}
+	}
+	// Collect every import path used anywhere, then match each against the
+	// directory map. An import path is the dir itself or has the dir as suffix.
+	seenIP := map[string]struct{}{}
+	for _, mp := range importMapByFile {
+		for _, ip := range mp {
+			ip = strings.Trim(ip, `"`)
+			if ip == "" {
+				continue
+			}
+			if _, ok := seenIP[ip]; ok {
+				continue
+			}
+			seenIP[ip] = struct{}{}
+			if id, ok := pkgNodeByImportPath[ip]; ok && id != "" {
+				continue
+			}
+			for dir, nodeID := range dirToPkgNode {
+				if ip == dir || strings.HasSuffix(ip, "/"+dir) {
+					pkgNodeByImportPath[ip] = nodeID
+					break
+				}
+			}
+		}
+	}
+	// Also register the current file's package node under its directory-derived
+	// import-path candidates so signature-edge resolution lookups can hit it.
+	for _, pr := range combined {
+		if pr == nil || !languageIsGo(pr) {
+			continue
+		}
+		for _, n := range pr.Nodes {
+			if n.Type == models.NodePackage && n.FilePath == pr.FilePath {
+				dir := path.Dir(strings.ReplaceAll(n.FilePath, "\\", "/"))
+				if dir != "" && dir != "." {
+					if _, exists := pkgNodeByImportPath[dir]; !exists {
+						pkgNodeByImportPath[dir] = n.ID
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// Re-key the symbol index: it was built with short package names (because
+	// the parser doesn't emit import paths). Now that we know each package's
+	// import path via pkgNodeByImportPath, add parallel entries so lookups
+	// keyed by the import path resolve too.
+	shortToIP := map[string]string{}
+	for ip, pkgNodeID := range pkgNodeByImportPath {
+		parts := strings.Split(pkgNodeID, ":")
+		if len(parts) >= 1 && parts[0] != "" {
+			if _, exists := shortToIP[parts[0]]; !exists {
+				shortToIP[parts[0]] = ip
+			}
+		}
+	}
+	for k, v := range global.any {
+		if ip, ok := shortToIP[k.pkg]; ok && ip != k.pkg {
+			if _, exists := global.any[symPair{ip, k.name}]; !exists {
+				global.any[symPair{ip, k.name}] = v
+			}
+		}
+	}
+	for k, v := range global.funcs {
+		parts := strings.SplitN(k, "\x00", 2)
+		if len(parts) == 2 {
+			if ip, ok := shortToIP[parts[0]]; ok && ip != parts[0] {
+				nk := symKeyFunc(ip, parts[1])
+				if _, exists := global.funcs[nk]; !exists {
+					global.funcs[nk] = v
+				}
+			}
+		}
+	}
+
 	for i := range result.Nodes {
 		e.annotateExported(&result.Nodes[i])
 	}
@@ -91,20 +188,64 @@ func (e GoExtractor) Extract(result *models.ParseResult, allResults []*models.Pa
 
 	for i := range result.Edges {
 		edge := &result.Edges[i]
-		if edge.Type != models.EdgeCalls {
-			continue
-		}
 		if edge.Metadata == nil {
 			edge.Metadata = map[string]string{}
 		}
 
-		toID, ok := e.resolveGoCall(edge, result.FilePath, currentPkg, importMapByFile, global)
-		if ok {
-			key := edgeKey(edge.From, toID, models.EdgeCalls)
-			if !seenEdge[key] {
-				edge.To = toID
-				edge.Metadata["call_resolved"] = "true"
-				seenEdge[key] = true
+		switch edge.Type {
+		case models.EdgeCalls:
+			toID, ok := e.resolveGoCall(edge, result.FilePath, currentPkg, importMapByFile, global)
+			if ok {
+				key := edgeKey(edge.From, toID, models.EdgeCalls)
+				if !seenEdge[key] {
+					edge.To = toID
+					edge.Metadata["call_resolved"] = "true"
+					seenEdge[key] = true
+				}
+			} else {
+				// Fallback: if the call qualifier matches an import alias in
+				// this file (e.g. `fmt.Println` where `fmt` is imported), point
+				// the edge at that import node. Otherwise the edge has an
+				// unresolvable `To` and gets silently dropped by the frontend
+				// — that's why so many cross-package dependencies were invisible.
+				qual, _ := goCallParts(edge)
+				if qual != "" {
+					if _, ok := importMapByFile[result.FilePath][qual]; ok {
+						// Derive import node ID from the calling function's ID
+						// (format: pkg:file:name) → reuse pkg + file segments.
+						if importID := goImportNodeIDFromCaller(edge.From, qual); importID != "" {
+							key := edgeKey(edge.From, importID, models.EdgeCalls)
+							if !seenEdge[key] {
+								edge.To = importID
+								edge.Metadata["call_resolved_to_import"] = "true"
+								seenEdge[key] = true
+							}
+						}
+					}
+				}
+			}
+		case models.EdgeReturns, models.EdgeDependsOn:
+			// Signature edges from the parser whose `To` is still a bare type
+			// name (parser couldn't resolve cross-file). Try the global index
+			// for the current package, then any package imported by this file.
+			if metaGetEdge(edge, "resolved") == "true" || strings.Contains(edge.To, ":") {
+				continue
+			}
+			name := strings.TrimSpace(edge.To)
+			if name == "" {
+				continue
+			}
+			if id, ok := global.lookupAny(currentPkg, name); ok {
+				edge.To = id
+				edge.Metadata["resolved"] = "true"
+				continue
+			}
+			for _, ip := range importMapByFile[result.FilePath] {
+				if id, ok := global.lookupAny(ip, name); ok {
+					edge.To = id
+					edge.Metadata["resolved"] = "true"
+					break
+				}
 			}
 		}
 	}
@@ -117,12 +258,45 @@ func (e GoExtractor) Extract(result *models.ParseResult, allResults []*models.Pa
 
 	e.addPackageDependencyEdges(result, pkgPathByFile, importMapByFile, pkgNodeByImportPath, seenEdge)
 
+	// Connect each per-file import node to the *target* package's package
+	// node. Without this, import nodes are leaves and the visual chain
+	// "caller → import → target folder" terminates at the import.
+	for _, n := range result.Nodes {
+		if n.Type != models.NodeImport {
+			continue
+		}
+		ip := firstNonEmpty(metaGet(&n, "path"), metaGet(&n, "import_path"), n.Name)
+		ip = strings.Trim(ip, `"`)
+		if ip == "" {
+			continue
+		}
+		toPkgNode := pkgNodeByImportPath[ip]
+		if toPkgNode == "" || toPkgNode == n.ID {
+			continue
+		}
+		key := edgeKey(n.ID, toPkgNode, models.EdgeDependsOn)
+		if seenEdge[key] {
+			continue
+		}
+		result.Edges = append(result.Edges, models.Edge{
+			From: n.ID,
+			To:   toPkgNode,
+			Type: models.EdgeDependsOn,
+			Metadata: map[string]string{
+				"language":    goLanguage,
+				"scope":       "import_target",
+				"import_path": ip,
+			},
+		})
+		seenEdge[key] = true
+	}
+
 	for _, iface := range collectInterfaces(combined) {
 		for _, st := range collectStructs(combined) {
-			if iface.pkgPath != st.pkgPath {
-				continue
-			}
-			if st.name == iface.name {
+			// Cross-package implementation is valid Go (e.g. http.Handler
+			// implemented by handlers in every package). Drop the same-pkg
+			// guard so we capture those edges too.
+			if st.name == iface.name && st.pkgPath == iface.pkgPath {
 				continue
 			}
 			if implementsGo(st.methods, iface.methodNames) {
@@ -335,6 +509,21 @@ func isProbablySelectorPackage(qual, currentPkg string) bool {
 	return qual != "" && (qual == path.Base(currentPkg) || strings.HasSuffix(currentPkg, "/"+qual))
 }
 
+// goImportNodeIDFromCaller derives the import-node ID for `alias` that lives
+// in the same file as the caller. Node IDs follow the parser's pkg:file:name
+// convention, so we reuse the pkg + file segments of the caller and swap the
+// trailing name for the import alias.
+func goImportNodeIDFromCaller(callerID, alias string) string {
+	if callerID == "" || alias == "" {
+		return ""
+	}
+	parts := strings.Split(callerID, ":")
+	if len(parts) < 3 {
+		return ""
+	}
+	return parts[0] + ":" + parts[1] + ":" + alias
+}
+
 func metaGetEdge(edge *models.Edge, k string) string {
 	if edge.Metadata == nil {
 		return ""
@@ -389,19 +578,36 @@ func newSymbolIndex() *symbolIndex {
 func (sx *symbolIndex) ingestParseResult(pr *models.ParseResult) {
 	pkg := findPackageImportPath(pr)
 	for _, n := range pr.Nodes {
-		p := pkg
+		// Index every symbol under BOTH the short package name (used in node
+		// IDs and `n.Package`) AND the import path (used by resolveGoCall and
+		// the signature-edge resolver). Either lookup path now hits.
+		keys := []string{}
 		if n.Package != "" {
-			p = n.Package
+			keys = append(keys, n.Package)
+		}
+		if pkg != "" && pkg != n.Package {
+			keys = append(keys, pkg)
+		}
+		if len(keys) == 0 || n.ID == "" {
+			continue
 		}
 		switch n.Type {
 		case models.NodeFunction:
-			if p != "" && n.ID != "" {
-				sx.funcs[symKeyFunc(p, n.Name)] = n.ID
-				sx.any[symPair{p, n.Name}] = n.ID
+			for _, k := range keys {
+				sx.funcs[symKeyFunc(k, n.Name)] = n.ID
+				sx.any[symPair{k, n.Name}] = n.ID
 			}
 		case models.NodeMethod:
-			if p != "" && n.ID != "" {
-				sx.any[symPair{p, methodNameFromNode(n)}] = n.ID
+			mn := methodNameFromNode(n)
+			for _, k := range keys {
+				sx.any[symPair{k, mn}] = n.ID
+			}
+		case models.NodeStruct, models.NodeInterface, models.NodeType_:
+			// Types are referenced by struct fields, function params/returns,
+			// and var declarations — index them so the signature-edge resolver
+			// can find them across packages.
+			for _, k := range keys {
+				sx.any[symPair{k, n.Name}] = n.ID
 			}
 		}
 	}

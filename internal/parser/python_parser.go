@@ -50,6 +50,10 @@ func (*PythonParser) Parse(filePath string, content []byte) (*models.ParseResult
 	if isTestPyFile(filePath) {
 		fileMeta["is_test"] = "true"
 	}
+	// Module-level docstring: first statement in the file if it's a string.
+	if ds := pyDocstring(root, content); ds != "" {
+		fileMeta["docstring"] = ds
+	}
 	ps.addNode(models.Node{
 		ID:        ps.fileID,
 		Name:      filepath.Base(filePath),
@@ -481,6 +485,9 @@ func (ps *parseState) handleClass(class *sitter.Node, decMeta map[string]string,
 	id := ps.nodeID(name)
 	md := defMetadata(name, decMeta)
 	sig := strings.TrimSpace(headerBeforeBody(class, ps.content))
+	if ds := pyDocstring(class.ChildByFieldName("body"), ps.content); ds != "" {
+		md["docstring"] = ds
+	}
 	ps.addNode(models.Node{
 		ID:        id,
 		Name:      name,
@@ -584,6 +591,10 @@ func (ps *parseState) handleFunction(fn *sitter.Node, decMeta map[string]string,
 	}
 	md := defMetadata(name, decMeta)
 	sig := strings.TrimSpace(headerBeforeBody(fn, ps.content))
+	// Docstring: the first statement in the body, if it's a string literal.
+	if ds := pyDocstring(fn.ChildByFieldName("body"), ps.content); ds != "" {
+		md["docstring"] = ds
+	}
 	ps.addNode(models.Node{
 		ID:        id,
 		Name:      name,
@@ -601,8 +612,99 @@ func (ps *parseState) handleFunction(fn *sitter.Node, decMeta map[string]string,
 		ps.bind(name, id)
 	}
 
+	// Signature dependencies: typed params → depends_on, return type → returns.
+	// Type hints are optional in Python; we only emit edges when an annotation
+	// is present. Resolution goes through the same binding/import lookup that
+	// resolveCall uses, so unannotated params and primitive types stay silent.
+	ps.recordPySignatureEdges(fn, id, className)
+
 	body := suiteBlock(fn.ChildByFieldName("body"))
 	ps.walkFunctionBody(body, id, qualified, className)
+}
+
+// recordPySignatureEdges walks a function_definition tree-sitter node, finds
+// any type annotations on parameters and the return type, and emits one edge
+// per referenced type. Targets are resolved via the same symbol/import binding
+// table used for calls; unresolved names get a foreignID and get dropped on
+// the frontend (same as unresolved calls).
+func (ps *parseState) recordPySignatureEdges(fn *sitter.Node, fnID, classCtx string) {
+	emit := func(typeText string, edgeType models.EdgeType, scope string) {
+		typeText = strings.TrimSpace(typeText)
+		if typeText == "" || isBuiltinPyType(typeText) {
+			return
+		}
+		for _, name := range pyTypeRefNames(typeText) {
+			if name == "" || isBuiltinPyType(name) {
+				continue
+			}
+			toID := ps.resolveSymbol(name, classCtx)
+			if toID == "" {
+				continue
+			}
+			ps.addEdge(models.Edge{
+				From: fnID,
+				To:   toID,
+				Type: edgeType,
+				Metadata: map[string]string{
+					"language": "python",
+					"scope":    scope,
+				},
+			})
+		}
+	}
+
+	if params := fn.ChildByFieldName("parameters"); params != nil {
+		for i := uint32(0); i < params.NamedChildCount(); i++ {
+			p := params.NamedChild(int(i))
+			if p == nil {
+				continue
+			}
+			if t := p.ChildByFieldName("type"); t != nil {
+				emit(t.Content(ps.content), models.EdgeDependsOn, "param")
+			}
+		}
+	}
+	if rt := fn.ChildByFieldName("return_type"); rt != nil {
+		emit(rt.Content(ps.content), models.EdgeReturns, "return")
+	}
+}
+
+// pyTypeRefNames extracts every named identifier appearing in a Python type
+// annotation expression. We don't parse it formally — a regex split on
+// non-identifier chars is good enough for `Optional[List[User]]`-style hints.
+func pyTypeRefNames(s string) []string {
+	out := []string{}
+	cur := strings.Builder{}
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '.' {
+			cur.WriteRune(r)
+		} else {
+			if cur.Len() > 0 {
+				out = append(out, cur.String())
+				cur.Reset()
+			}
+		}
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
+}
+
+// isBuiltinPyType filters out Python built-in / typing stdlib names so we
+// don't drown the graph in noise.
+func isBuiltinPyType(name string) bool {
+	switch name {
+	case "int", "str", "bool", "float", "bytes", "bytearray", "complex",
+		"list", "dict", "set", "tuple", "frozenset",
+		"None", "object", "type", "Any", "Optional", "Union", "List", "Dict",
+		"Tuple", "Set", "FrozenSet", "Sequence", "Iterable", "Iterator",
+		"Mapping", "MutableMapping", "Callable", "Awaitable", "Coroutine",
+		"AsyncIterable", "AsyncIterator", "Generator", "AsyncGenerator",
+		"ClassVar", "Final", "Literal", "Self":
+		return true
+	}
+	return false
 }
 
 func (ps *parseState) walkFunctionBody(body *sitter.Node, fnID, qualName, enclosingClass string) {
@@ -714,6 +816,19 @@ func (ps *parseState) resolveCall(key string, classCtx string) string {
 		if id := ps.resolveSymbol(suffix, classCtx); id != "" {
 			return id
 		}
+		// Fallback: try the qualifier itself (`requests` in `requests.get`).
+		// If it resolves to an import node, the call points at that import —
+		// captures cross-package dependencies even when the symbol is unknown.
+		prefix := key[:i]
+		if id := ps.resolveSymbol(prefix, classCtx); id != "" {
+			return id
+		}
+		// Also try the head-most segment (`a` in `a.b.c`) for chained access.
+		if j := strings.IndexByte(prefix, '.'); j > 0 {
+			if id := ps.resolveSymbol(prefix[:j], classCtx); id != "" {
+				return id
+			}
+		}
 	}
 	return ""
 }
@@ -783,6 +898,47 @@ func firstFunctionOrClassName(fn *sitter.Node, src []byte) string {
 		if ch.Type() == "identifier" {
 			return strings.TrimSpace(ch.Content(src))
 		}
+	}
+	return ""
+}
+
+// pyDocstring returns the docstring text of a function/class body — i.e. the
+// first statement if it's a bare string literal. Returns "" when no docstring
+// is present. Strips surrounding triple-quotes when found.
+func pyDocstring(body *sitter.Node, src []byte) string {
+	block := suiteBlock(body)
+	if block == nil {
+		return ""
+	}
+	for i := uint32(0); i < block.NamedChildCount(); i++ {
+		stmt := block.NamedChild(int(i))
+		if stmt == nil {
+			continue
+		}
+		// First statement must be an expression_statement whose only child is a string.
+		if stmt.Type() != "expression_statement" {
+			return ""
+		}
+		if stmt.NamedChildCount() == 0 {
+			return ""
+		}
+		expr := stmt.NamedChild(0)
+		if expr == nil || expr.Type() != "string" {
+			return ""
+		}
+		raw := strings.TrimSpace(string(src[expr.StartByte():expr.EndByte()]))
+		raw = strings.TrimPrefix(raw, "r")
+		raw = strings.TrimPrefix(raw, "R")
+		raw = strings.TrimPrefix(raw, "b")
+		raw = strings.TrimPrefix(raw, "B")
+		raw = strings.TrimPrefix(raw, "u")
+		raw = strings.TrimPrefix(raw, "U")
+		for _, q := range []string{`"""`, `'''`, `"`, `'`} {
+			if strings.HasPrefix(raw, q) && strings.HasSuffix(raw, q) && len(raw) >= 2*len(q) {
+				return strings.TrimSpace(raw[len(q) : len(raw)-len(q)])
+			}
+		}
+		return raw
 	}
 	return ""
 }

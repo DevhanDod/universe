@@ -4,11 +4,28 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Universe/universe/internal/graph"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// sliceLines returns the inclusive 1-indexed line range [start..end] from content.
+// Falls back to the whole content when bounds are invalid or out of range.
+func sliceLines(content string, start, end int) string {
+	if content == "" || start <= 0 || end < start {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	if start > len(lines) {
+		return ""
+	}
+	if end > len(lines) {
+		end = len(lines)
+	}
+	return strings.Join(lines[start-1:end], "\n")
+}
 
 // ── Overview ──────────────────────────────────────────────────────────────────
 
@@ -729,6 +746,14 @@ func QueryGraphNodeDetail(db *pgxpool.Pool, g *graph.Graph, nodeID string) (*Gra
 				Kind:    string(n.Type),
 				Package: n.Package,
 				File:    n.FilePath,
+			}
+			detail.StartLine = n.StartLine
+			detail.EndLine = n.EndLine
+			detail.Signature = n.Signature
+			detail.Metadata = n.Metadata
+			if fi, ok := g.Files[n.FilePath]; ok && fi != nil {
+				detail.Language = fi.Language
+				detail.SourcePreview = sliceLines(fi.Content, n.StartLine, n.EndLine)
 			}
 		}
 		for _, dep := range g.GetDependents(nodeID) {

@@ -327,10 +327,16 @@ type GraphEdgesResponse struct {
 }
 
 type GraphNodeDetailResponse struct {
-	Node        GraphNodeRow   `json:"node"`
-	Callers     []string       `json:"callers"`
-	Callees     []string       `json:"callees"`
-	Memories    []ObservationRow `json:"memories"`
-	Skills      []SkillRow     `json:"skills"`
-	RecentRoutes []RoutingTaskRow `json:"recent_routes"`
+	Node          GraphNodeRow      `json:"node"`
+	StartLine     int               `json:"start_line"`
+	EndLine       int               `json:"end_line"`
+	Signature     string            `json:"signature,omitempty"`
+	Metadata      map[string]string `json:"metadata,omitempty"`
+	SourcePreview string            `json:"source_preview,omitempty"`
+	Language      string            `json:"language,omitempty"`
+	Callers       []string          `json:"callers"`
+	Callees       []string          `json:"callees"`
+	Memories      []ObservationRow  `json:"memories"`
+	Skills        []SkillRow        `json:"skills"`
+	RecentRoutes  []RoutingTaskRow  `json:"recent_routes"`
 }
