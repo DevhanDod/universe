@@ -35,9 +35,24 @@ universe start
 
 ## Connect database (optional — enables memory and skills)
 
+Requires Docker installed and running ([get Docker](https://docs.docker.com/get-docker/)). You do **not** need to install PostgreSQL — the container ships with Postgres + pgvector.
+
 ```bash
-docker compose up -d
-universe config set db postgres://universe_admin:universe_secret_2024@localhost:5433/universe
+universe db start      # spins up Postgres in Docker, auto-saves connection URL
+universe db migrate    # creates tables
+universe db status     # verify connection
+```
+
+To stop the database later:
+
+```bash
+universe db stop
+```
+
+**Manual connection (advanced)** — if you're pointing at your own Postgres instance instead of the bundled Docker one:
+
+```bash
+universe config set db postgres://<user>:<password>@<host>:<port>/<database>
 universe db migrate
 ```
 
@@ -57,7 +72,9 @@ universe db migrate
 | `universe config set execution_model <name>` | Change execution model |
 | `universe config get db` | Show database connection |
 | `universe config get models` | Show model configuration |
-| `universe db status` | Test database connection |
+| `universe db start` | Start local Postgres + pgvector in Docker (auto-saves URL) |
+| `universe db stop` | Stop the local Postgres container |
+| `universe db status` | Test database connection and show table status |
 | `universe db migrate` | Run database migrations |
 | `universe skills list` | List all active skills |
 | `universe setup-rules` | Regenerate Cursor rules |
