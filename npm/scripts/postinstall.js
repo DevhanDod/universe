@@ -94,13 +94,11 @@ async function main() {
         console.log('  universe status      Check engines');
         console.log('');
 
-        // Windows Git Bash PATH hint
+        // Windows: auto-write a Git Bash alias so `universe` works in MINGW/Git Bash.
+        // The npm-generated shim has known path-resolution issues on Git Bash; calling
+        // the .exe directly via alias avoids them entirely.
         if (os.platform() === 'win32') {
-            console.log('Note for Git Bash users:');
-            console.log('  If "universe" command is not found, add npm to your PATH:');
-            console.log('  export PATH="$PATH:/c/Users/$USER/AppData/Roaming/npm"');
-            console.log('  Make permanent: echo the line above >> ~/.bashrc');
-            console.log('');
+            installGitBashAlias(targetPath);
         }
 
     } catch (error) {
@@ -127,6 +125,47 @@ async function main() {
 
         // Don't exit 1 — let npm install succeed
         // The wrapper.js will show a clear error when the user tries to run it
+    }
+}
+
+// ============================================================
+// GIT BASH ALIAS — fixes Windows MINGW shim path resolution
+// ============================================================
+
+function installGitBashAlias(binaryPath) {
+    try {
+        const home = os.homedir();
+        const bashrc = path.join(home, '.bashrc');
+
+        // Convert C:\Users\foo\...\universe.exe -> /c/Users/foo/.../universe.exe
+        const unixPath = binaryPath
+            .replace(/\\/g, '/')
+            .replace(/^([A-Za-z]):/, (_, d) => '/' + d.toLowerCase());
+
+        const aliasLine = `alias universe="${unixPath}"`;
+        const marker = '# Added by @devhand/universe postinstall (Git Bash shim fix)';
+
+        let content = '';
+        if (fs.existsSync(bashrc)) {
+            content = fs.readFileSync(bashrc, 'utf8');
+        }
+
+        // Strip any prior universe alias (and its marker) to avoid duplicates on reinstall.
+        content = content
+            .split('\n')
+            .filter(line => !line.startsWith('alias universe=') && line !== marker)
+            .join('\n')
+            .replace(/\n{3,}/g, '\n\n')
+            .trimEnd();
+
+        const block = `\n\n${marker}\n${aliasLine}\n`;
+        fs.writeFileSync(bashrc, content + block);
+
+        console.log('[universe] Git Bash: alias added to ~/.bashrc');
+        console.log('[universe] Open a new Git Bash terminal — or run: source ~/.bashrc');
+    } catch (e) {
+        // Silent: not all Windows users have Git Bash. The npm shim still works in
+        // PowerShell and cmd, so a missing .bashrc isn't fatal.
     }
 }
 
