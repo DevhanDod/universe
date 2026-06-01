@@ -136,14 +136,13 @@ async function main() {
 
 function downloadFile(url, destPath) {
     return new Promise((resolve, reject) => {
-        // Ensure target directory exists
         const dir = path.dirname(destPath);
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
 
-        const file = fs.createWriteStream(destPath);
         let redirectCount = 0;
+        let insecure = process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0';
 
         function doRequest(requestUrl) {
             if (redirectCount++ > 5) {
@@ -151,24 +150,25 @@ function downloadFile(url, destPath) {
                 return;
             }
 
-            // SSL options — try with strict SSL first, fall back to permissive
+            // Fresh write stream per attempt — reusing a closed stream silently
+            // drops the response data, which is what caused retries to hang.
+            const file = fs.createWriteStream(destPath);
+
             const requestOptions = {
                 headers: {
                     'User-Agent': `@devhand/universe-npm/${require('../package.json').version}`
                 }
             };
-
-            // If NODE_TLS_REJECT_UNAUTHORIZED is set to '0', respect it
-            // This allows: NODE_TLS_REJECT_UNAUTHORIZED=0 npm install -g @devhand/universe
-            if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
+            if (insecure) {
                 requestOptions.rejectUnauthorized = false;
             }
 
             const protocol = requestUrl.startsWith('https') ? https : require('http');
 
             protocol.get(requestUrl, requestOptions, (response) => {
-                // Follow redirects (GitHub releases redirect to S3/CDN)
                 if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                    file.close();
+                    try { fs.unlinkSync(destPath); } catch {}
                     doRequest(response.headers.location);
                     return;
                 }
@@ -223,15 +223,15 @@ function downloadFile(url, destPath) {
                 file.close();
                 try { fs.unlinkSync(destPath); } catch {}
 
-                // If SSL error and we haven't tried permissive mode yet, retry
                 if ((err.message.includes('self-signed') ||
                      err.message.includes('certificate') ||
                      err.message.includes('UNABLE_TO_VERIFY')) &&
-                    process.env.NODE_TLS_REJECT_UNAUTHORIZED !== '0') {
+                    !insecure) {
 
                     console.log('[universe] SSL error detected — retrying without certificate validation...');
-                    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-                    doRequest(requestUrl);
+                    insecure = true;
+                    redirectCount = 0;
+                    doRequest(url);
                     return;
                 }
 
