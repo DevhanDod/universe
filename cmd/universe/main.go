@@ -12,6 +12,7 @@ import (
 	"github.com/Universe/universe/internal/analyzer"
 	"github.com/Universe/universe/internal/extractor"
 	"github.com/Universe/universe/internal/graph"
+	"github.com/Universe/universe/internal/languages"
 	"github.com/Universe/universe/internal/models"
 	"github.com/Universe/universe/internal/parser"
 	"github.com/spf13/cobra"
@@ -29,7 +30,7 @@ func main() {
 		fmt.Sprintf("path to saved graph JSON (default: ./%s)", defaultGraphRel))
 
 	rootCmd.AddCommand(analyzeCmd, queryCmd, statsCmd, graphCmd, mcpCmd, configCmd, dashboardCmd,
-		initCmd, statusCmd, dbCmd, skillsCmd)
+		initCmd, statusCmd, dbCmd, skillsCmd, languagesCmd)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -108,6 +109,8 @@ func runAnalyze(cmd *cobra.Command, args []string) error {
 	printStatsBlockTo(stats, logw)
 
 	printPackageDepsTo(g, logw)
+
+	printUnsupportedLanguagesTo(g, logw)
 
 	outPath := resolvedGraphPath()
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
@@ -245,6 +248,95 @@ func printCoverageTo(c models.Coverage, w io.Writer) {
 				k, b.Files, b.FilesParsed, humanBytes(b.Bytes), humanBytes(b.BytesParsed))
 		}
 	}
+}
+
+// printUnsupportedLanguagesTo scans the graph's file nodes, looks each up in
+// the language manifest, and reports which languages were detected but parsed
+// at less than the manifest's claimed tier — including completely unsupported
+// languages (no manifest entry at all). This is the feedback loop: it tells
+// the user what's missing, and tells us what to prioritise next.
+func printUnsupportedLanguagesTo(g *graph.Graph, w io.Writer) {
+	type langStat struct {
+		fileCount int
+		isKnown   bool   // present in the manifest
+		support   languages.Support
+	}
+	stats := map[string]*langStat{}
+	unknownByExt := map[string]int{} // extensions with no manifest entry
+
+	for _, n := range g.Nodes {
+		if n == nil || n.Type != models.NodeFile {
+			continue
+		}
+		// Skip synthetic nodes (gitignore patterns) — those aren't real files.
+		if n.Metadata != nil && n.Metadata["kind"] == "gitignore_pattern" {
+			continue
+		}
+		path := n.FilePath
+		if path == "" {
+			continue
+		}
+		lang := languages.Lookup(path)
+		if lang == nil {
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == "" {
+				ext = "(no extension)"
+			}
+			unknownByExt[ext]++
+			continue
+		}
+		s, ok := stats[lang.Name]
+		if !ok {
+			s = &langStat{isKnown: true, support: lang.Support}
+			stats[lang.Name] = s
+		}
+		s.fileCount++
+	}
+
+	// Anything in the manifest at inventory tier counts as "detected but not
+	// yet supported" — the user has files in that language, and we don't
+	// structurally understand them.
+	var pending []string
+	for name, s := range stats {
+		if s.support == languages.SupportInventory {
+			pending = append(pending, fmt.Sprintf("   %-14s %d files  — %s (planned)",
+				name, s.fileCount, supportNeedLabel(s.support)))
+		}
+	}
+	if len(pending) == 0 && len(unknownByExt) == 0 {
+		return
+	}
+
+	fmt.Fprintf(w, "\n⚠️  Languages detected without full support:\n")
+	sort.Strings(pending)
+	for _, line := range pending {
+		fmt.Fprintln(w, line)
+	}
+	if len(unknownByExt) > 0 {
+		exts := make([]string, 0, len(unknownByExt))
+		for e := range unknownByExt {
+			exts = append(exts, e)
+		}
+		sort.Strings(exts)
+		for _, e := range exts {
+			fmt.Fprintf(w, "   %-14s %d files  — unknown to universe\n", e, unknownByExt[e])
+		}
+	}
+	fmt.Fprintln(w, "   Run `universe languages` for the full support matrix.")
+}
+
+func supportNeedLabel(s languages.Support) string {
+	switch s {
+	case languages.SupportInventory:
+		return "inventory tier (no parser)"
+	case languages.SupportSymbolic:
+		return "symbolic tier (regex)"
+	case languages.SupportStructural:
+		return "structural tier (tree-sitter)"
+	case languages.SupportDeep:
+		return "deep tier (full parser)"
+	}
+	return string(s)
 }
 
 func humanBytes(n int64) string {
