@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -125,10 +126,8 @@ func (a *Analyzer) Analyze(projectPath string) (*graph.Graph, error) {
 
 				p := a.registry.GetParser(f.Extension)
 				if p == nil {
-					parseMu.Lock()
-					parseErrs++
-					parseMu.Unlock()
-					log.Printf("analyzer: no parser for extension %s (%s)", f.Extension, f.Path)
+					// No structural parser — file still gets a NodeFile later
+					// in buildFileInventory. Skip parsing, don't log as error.
 					continue
 				}
 
@@ -175,6 +174,12 @@ func (a *Analyzer) Analyze(projectPath string) (*graph.Graph, error) {
 	}
 
 	for _, f := range files {
+		// Only dispatch files a parser will accept. Non-source files (configs,
+		// images, binaries, docs) get a FileNode minted directly in
+		// buildFileInventory below — no need to read their bytes.
+		if f.Language == "" || f.IsBinary {
+			continue
+		}
 		jobs <- f
 	}
 	close(jobs)
@@ -208,10 +213,132 @@ func (a *Analyzer) Analyze(projectPath string) (*graph.Graph, error) {
 		mergeParseResultIntoGraph(a.graph, pr, seenEdges)
 	}
 
+	// Build the file inventory: every file the scanner saw, parser or not.
+	// Decorates already-created file nodes with kind/ignored/size, and creates
+	// fresh NodeFile entries for everything else (configs, images, binaries,
+	// docs). Also synthesises GitignorePattern nodes + Ignores edges.
+	a.buildFileInventory(files, projectPath)
+
+	// Coverage = parsed source bytes / total bytes (excluding binaries).
+	// Stored on the graph so it shows up in Stats().
+	a.graph.SetCoverage(computeCoverage(files))
+
 	if a.verbose {
 		log.Printf("analyzer: files found=%d parsed=%d parse errors=%d", found, parsed, parseErrs)
 	}
 	return a.graph, nil
+}
+
+// buildFileInventory ensures every scanned file is represented in the graph,
+// tagged with kind/ignored/binary/size so the agent can filter and so the
+// coverage metric isn't blind to non-source files.
+func (a *Analyzer) buildFileInventory(files []scanner.ScannedFile, projectPath string) {
+	// Map relative path -> existing node so we can decorate rather than dup.
+	existingByPath := map[string]*models.Node{}
+	for _, n := range a.graph.Nodes {
+		if n == nil || n.Type != models.NodeFile {
+			continue
+		}
+		existingByPath[n.FilePath] = n
+	}
+
+	gitignoreNodes := map[string]string{} // source -> nodeID
+
+	for _, f := range files {
+		relPath, _ := filepath.Rel(projectPath, f.Path)
+		if relPath == "" {
+			relPath = f.Path
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		node := existingByPath[relPath]
+		if node == nil {
+			// Find by absolute path too — Go parser stores absolute file paths.
+			node = existingByPath[filepath.ToSlash(f.Path)]
+		}
+		if node == nil {
+			// Mint a file node for non-source files (configs, images, …).
+			id := "file:" + relPath
+			node = &models.Node{
+				ID:        id,
+				Name:      filepath.Base(relPath),
+				Type:      models.NodeFile,
+				FilePath:  relPath,
+				StartLine: 1,
+				EndLine:   1,
+				Metadata:  map[string]string{},
+			}
+			a.graph.AddNode(node)
+		}
+		if node.Metadata == nil {
+			node.Metadata = map[string]string{}
+		}
+		node.Metadata["kind"] = f.Kind
+		node.Metadata["size"] = strconv.FormatInt(f.Size, 10)
+		if f.IsBinary {
+			node.Metadata["is_binary"] = "true"
+		}
+		if f.IsGenerated {
+			node.Metadata["is_generated"] = "true"
+		}
+		if f.IsIgnored {
+			node.Metadata["is_ignored"] = "true"
+			node.Metadata["ignored_by"] = f.IgnoredBy
+
+			// One GitignorePattern node per distinct source, plus an Ignores edge.
+			// Lets the agent ask "what does .gitignore drop?" with one query.
+			patternID, ok := gitignoreNodes[f.IgnoredBy]
+			if !ok {
+				patternID = "gitignore:" + f.IgnoredBy
+				gitignoreNodes[f.IgnoredBy] = patternID
+				a.graph.AddNode(&models.Node{
+					ID:       patternID,
+					Name:     f.IgnoredBy,
+					Type:     models.NodeFile, // reuse — no NodePattern type today
+					FilePath: f.IgnoredBy,
+					Metadata: map[string]string{"kind": "gitignore_pattern"},
+				})
+			}
+			a.graph.AddEdge(&models.Edge{
+				From: patternID,
+				To:   node.ID,
+				Type: models.EdgeIgnores,
+			})
+		}
+	}
+}
+
+// computeCoverage produces a multi-angle view of how much of the codebase the
+// graph actually understands. File-only counts lie (one giant unparsed file
+// equals a tiny .gitignore), so we report byte coverage too and break it down
+// by kind.
+func computeCoverage(files []scanner.ScannedFile) models.Coverage {
+	cov := models.Coverage{
+		Breakdown: map[string]models.CoverageBucket{},
+	}
+	for _, f := range files {
+		cov.TotalFiles++
+		cov.TotalBytes += f.Size
+
+		b := cov.Breakdown[f.Kind]
+		b.Files++
+		b.Bytes += f.Size
+
+		if f.Language != "" && !f.IsBinary {
+			cov.ParsedFiles++
+			cov.ParsedBytes += f.Size
+			b.FilesParsed++
+			b.BytesParsed += f.Size
+		}
+		cov.Breakdown[f.Kind] = b
+	}
+	if cov.TotalFiles > 0 {
+		cov.FileCoverage = float64(cov.ParsedFiles) / float64(cov.TotalFiles)
+	}
+	if cov.TotalBytes > 0 {
+		cov.ByteCoverage = float64(cov.ParsedBytes) / float64(cov.TotalBytes)
+	}
+	return cov
 }
 
 func (a *Analyzer) Graph() *graph.Graph {

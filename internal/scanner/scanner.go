@@ -9,27 +9,34 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Universe/universe/internal/models"
 	"github.com/Universe/universe/internal/parser"
 )
 
-var skipDirs = map[string]struct{}{
-	".git":         {},
-	"vendor":       {},
+// hardSkipDirs are directories we never descend into regardless of gitignore.
+// .git itself is internal storage (not user content); the others are caches
+// that would balloon scan time without giving the agent anything useful.
+var hardSkipDirs = map[string]struct{}{
+	".git":        {},
 	"node_modules": {},
 	"__pycache__":  {},
 	".venv":        {},
 	"venv":         {},
-	"env":          {},
-	"dist":         {},
-	"build":        {},
-	"target":       {},
-	".terraform":   {},
 }
 
+// ScannedFile describes every file the scanner emits — including ones with no
+// parser and ones matched by .gitignore. Tags let the analyzer/agent decide
+// what to do rather than the scanner silently dropping them.
 type ScannedFile struct {
-	Path      string
-	Extension string
-	Language  string
+	Path       string
+	Extension  string
+	Language   string // "" when no parser claims this extension
+	Kind       string // models.FileKind*
+	Size       int64
+	IsBinary   bool
+	IsIgnored  bool   // matched a .gitignore pattern
+	IgnoredBy  string // "<gitignore file>:<line>" or pattern text
+	IsGenerated bool  // *.pb.go, *_generated.go, …
 }
 
 type Scanner struct {
@@ -49,14 +56,17 @@ func isHiddenDirName(name string) bool {
 	}
 }
 
-func shouldSkipDir(name string) bool {
-	if _, skip := skipDirs[name]; skip {
+func shouldHardSkipDir(name string) bool {
+	if _, skip := hardSkipDirs[name]; skip {
 		return true
 	}
+	// hidden dirs (.idea, .vscode, .terraform, …) — still skipped from descent
+	// because they're rarely useful and explode the file count. Users who need
+	// them can drop the prefix.
 	return isHiddenDirName(name)
 }
 
-func shouldSkipFilename(path string) bool {
+func isGeneratedFilename(path string) bool {
 	base := filepath.Base(path)
 	if strings.HasSuffix(base, ".pb.go") {
 		return true
@@ -88,11 +98,45 @@ func fileLooksBinary(path string) bool {
 	return bytes.IndexByte(buf[:n], 0) >= 0
 }
 
-// Scan walks the directory tree and returns all parseable source files
+// classifyFile picks a FileKind from extension + name. Used for files with no
+// structural parser so the graph still knows what they are.
+func classifyFile(path string, isBinary bool) string {
+	base := strings.ToLower(filepath.Base(path))
+	ext := strings.ToLower(filepath.Ext(path))
+
+	switch ext {
+	case ".md", ".rst", ".txt", ".adoc":
+		return models.FileKindDoc
+	case ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp":
+		return models.FileKindImage
+	case ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
+		".json", ".xml", ".properties", ".tf", ".tfvars":
+		return models.FileKindConfig
+	case ".lock":
+		return models.FileKindLockfile
+	}
+	switch base {
+	case "dockerfile", "makefile", "rakefile", "gemfile", "procfile", ".gitignore",
+		".dockerignore", ".editorconfig", ".gitattributes":
+		return models.FileKindConfig
+	case "go.sum", "package-lock.json", "yarn.lock", "poetry.lock", "pnpm-lock.yaml", "cargo.lock":
+		return models.FileKindLockfile
+	}
+	if isBinary {
+		return models.FileKindBinary
+	}
+	return models.FileKindOther
+}
+
+// Scan walks the directory tree and returns every file (parseable or not),
+// tagged with kind / ignored / binary status. The analyzer decides what to do
+// with each tag; the scanner no longer silently drops files.
 func (s *Scanner) Scan(rootPath string) ([]ScannedFile, error) {
 	var out []ScannedFile
 
 	root := filepath.Clean(rootPath)
+	ignore := loadGitignores(root)
+
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			log.Printf("scanner: %s: %v", path, walkErr)
@@ -102,26 +146,43 @@ func (s *Scanner) Scan(rootPath string) ([]ScannedFile, error) {
 			if filepath.Clean(path) == root {
 				return nil
 			}
-			if shouldSkipDir(d.Name()) {
+			if shouldHardSkipDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if shouldSkipFilename(path) {
-			return nil
+
+		info, err := d.Info()
+		var size int64
+		if err == nil {
+			size = info.Size()
 		}
-		if fileLooksBinary(path) {
-			return nil
-		}
+
+		isBinary := fileLooksBinary(path)
 		ext := strings.ToLower(filepath.Ext(path))
 		p := s.registry.GetParser(ext)
-		if p == nil {
-			return nil
+
+		kind := models.FileKindOther
+		lang := ""
+		if p != nil && !isBinary {
+			kind = models.FileKindSource
+			lang = p.Language()
+		} else {
+			kind = classifyFile(path, isBinary)
 		}
+
+		ignored, ignoredBy := ignore.match(path, root)
+
 		out = append(out, ScannedFile{
-			Path:      path,
-			Extension: ext,
-			Language:  p.Language(),
+			Path:        path,
+			Extension:   ext,
+			Language:    lang,
+			Kind:        kind,
+			Size:        size,
+			IsBinary:    isBinary,
+			IsIgnored:   ignored,
+			IgnoredBy:   ignoredBy,
+			IsGenerated: isGeneratedFilename(path),
 		})
 		return nil
 	})

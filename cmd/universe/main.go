@@ -220,6 +220,44 @@ func printStatsBlockTo(s graph.GraphStats, w io.Writer) {
 		fmt.Fprintf(w, "   Nodes by type:\n")
 		printSortedCountsTo(s.NodesByType, "      ", w)
 	}
+	printCoverageTo(s.Coverage, w)
+}
+
+func printCoverageTo(c models.Coverage, w io.Writer) {
+	if c.TotalFiles == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n📈 Coverage:\n")
+	fmt.Fprintf(w, "   Files parsed: %d / %d (%.1f%%)\n",
+		c.ParsedFiles, c.TotalFiles, c.FileCoverage*100)
+	fmt.Fprintf(w, "   Bytes parsed: %s / %s (%.1f%%)\n",
+		humanBytes(c.ParsedBytes), humanBytes(c.TotalBytes), c.ByteCoverage*100)
+	if len(c.Breakdown) > 0 {
+		fmt.Fprintf(w, "   By kind:\n")
+		kinds := make([]string, 0, len(c.Breakdown))
+		for k := range c.Breakdown {
+			kinds = append(kinds, k)
+		}
+		sort.Strings(kinds)
+		for _, k := range kinds {
+			b := c.Breakdown[k]
+			fmt.Fprintf(w, "      • %-10s files=%d parsed=%d  bytes=%s parsed=%s\n",
+				k, b.Files, b.FilesParsed, humanBytes(b.Bytes), humanBytes(b.BytesParsed))
+		}
+	}
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%dB", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%cB", float64(n)/float64(div), "KMGT"[exp])
 }
 
 func printSortedCountsTo(m map[string]int, indent string, w io.Writer) {

@@ -10,10 +10,17 @@ import (
 )
 
 type Graph struct {
-	mu    sync.RWMutex
-	Nodes map[string]*models.Node     `json:"nodes"`
-	Edges []*models.Edge              `json:"edges"`
-	Files map[string]*models.FileInfo `json:"files"`
+	mu       sync.RWMutex
+	Nodes    map[string]*models.Node     `json:"nodes"`
+	Edges    []*models.Edge              `json:"edges"`
+	Files    map[string]*models.FileInfo `json:"files"`
+	Coverage models.Coverage             `json:"coverage"`
+}
+
+func (g *Graph) SetCoverage(c models.Coverage) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.Coverage = c
 }
 
 func NewGraph() *Graph {
@@ -202,14 +209,16 @@ func (g *Graph) Stats() GraphStats {
 	}
 	stats.PackageCount = len(packages)
 	stats.FileCount = len(files)
+	stats.Coverage = g.Coverage
 	return stats
 }
 
 type GraphStats struct {
-	TotalNodes   int            `json:"total_nodes"`
-	TotalEdges   int            `json:"total_edges"`
-	NodesByType  map[string]int `json:"nodes_by_type"`
-	EdgesByType  map[string]int `json:"edges_by_type"`
-	PackageCount int            `json:"package_count"`
-	FileCount    int            `json:"file_count"`
+	TotalNodes   int             `json:"total_nodes"`
+	TotalEdges   int             `json:"total_edges"`
+	NodesByType  map[string]int  `json:"nodes_by_type"`
+	EdgesByType  map[string]int  `json:"edges_by_type"`
+	PackageCount int             `json:"package_count"`
+	FileCount    int             `json:"file_count"`
+	Coverage     models.Coverage `json:"coverage"`
 }
