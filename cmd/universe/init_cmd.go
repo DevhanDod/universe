@@ -44,9 +44,11 @@ func runInit(_ *cobra.Command, _ []string) error {
 	fmt.Println()
 
 	fmt.Print("   Parsing with tree-sitter...")
-	// includeSource=true so the dashboard's Code Inspector and detail endpoint
-	// can return real source slices instead of empty strings.
-	an := buildAnalyzer(false, true)
+	// includeSource=false: source is read from disk on demand (by the
+	// dashboard and MCP tools that need it). Storing it in graph.json
+	// duplicated every source byte and made the file ~10x larger than
+	// the structural data warranted.
+	an := buildAnalyzer(false, false)
 	g, err := an.Analyze(absPath)
 	if err != nil {
 		return fmt.Errorf("analyze: %w", err)
@@ -65,6 +67,13 @@ func runInit(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("save graph: %w", err)
 	}
 	fmt.Printf("   Stored: %s\n", localPath)
+
+	// Drop a Cursor rule that steers the agent to MCP tools instead of
+	// reading .universe/graph.json raw — the file no longer holds source,
+	// but the rule still saves the agent from a wasted exploration step.
+	if wrote, rulePath, err := writeCursorRule(absPath); err == nil && wrote {
+		fmt.Printf("   Cursor rule: %s\n", rulePath)
+	}
 
 	elapsed := time.Since(start).Round(time.Millisecond)
 	fmt.Println()

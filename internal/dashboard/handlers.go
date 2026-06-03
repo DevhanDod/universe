@@ -305,7 +305,7 @@ func (s *Server) HandleGraphNodeDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing node id")
 		return
 	}
-	detail, err := QueryGraphNodeDetail(s.db, s.graph, nodeID)
+	detail, err := QueryGraphNodeDetail(s.db, s.graph, s.projectDir, nodeID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

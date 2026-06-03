@@ -4,12 +4,36 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/Universe/universe/internal/graph"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// readSourceSlice reads the inclusive [start..end] line range from a file on
+// disk. Used by the dashboard's node-detail endpoint now that we no longer
+// embed full source in graph.json. filePath is whatever the graph recorded —
+// it may be relative to the project root or absolute, so we try both.
+func readSourceSlice(projectDir, filePath string, start, end int) string {
+	if filePath == "" || start <= 0 {
+		return ""
+	}
+	candidates := []string{filePath}
+	if projectDir != "" && !filepath.IsAbs(filePath) {
+		candidates = append(candidates, filepath.Join(projectDir, filePath))
+	}
+	for _, p := range candidates {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		return sliceLines(string(b), start, end)
+	}
+	return ""
+}
 
 // sliceLines returns the inclusive 1-indexed line range [start..end] from content.
 // Falls back to the whole content when bounds are invalid or out of range.
@@ -734,7 +758,7 @@ func QueryGraphNodesWithBadges(db *pgxpool.Pool, g *graph.Graph) (*GraphNodesRes
 	return &GraphNodesResponse{Nodes: nodes}, nil
 }
 
-func QueryGraphNodeDetail(db *pgxpool.Pool, g *graph.Graph, nodeID string) (*GraphNodeDetailResponse, error) {
+func QueryGraphNodeDetail(db *pgxpool.Pool, g *graph.Graph, projectDir, nodeID string) (*GraphNodeDetailResponse, error) {
 	var detail GraphNodeDetailResponse
 
 	if g != nil {
@@ -753,8 +777,10 @@ func QueryGraphNodeDetail(db *pgxpool.Pool, g *graph.Graph, nodeID string) (*Gra
 			detail.Metadata = n.Metadata
 			if fi, ok := g.Files[n.FilePath]; ok && fi != nil {
 				detail.Language = fi.Language
-				detail.SourcePreview = sliceLines(fi.Content, n.StartLine, n.EndLine)
 			}
+			// Source is no longer stored in graph.json — read the slice from
+			// disk on demand. Empty string is fine if the file has moved.
+			detail.SourcePreview = readSourceSlice(projectDir, n.FilePath, n.StartLine, n.EndLine)
 		}
 		for _, dep := range g.GetDependents(nodeID) {
 			if dep != nil {

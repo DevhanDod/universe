@@ -84,10 +84,16 @@ func (g *GoParser) Parse(filePath string, content []byte) (*models.ParseResult, 
 		Metadata:  pkgMeta,
 	})
 
+	// Full file content used to live here as fileMeta["content"]; removed to
+	// keep graph.json compact and to deny agents a tempting "just slurp the
+	// graph file" path that bypasses MCP. Readers should open the file
+	// directly using FilePath when source is needed.
+	//
+	// file_structure (a one-line file outline) was also stored here but had
+	// no readers — dropped to shave another ~130KB on this repo.
+	_ = fileStructure
 	fileMeta := map[string]string{
-		"content":        string(content),
-		"total_lines":    strconv.Itoa(totalLines),
-		"file_structure": fileStructure,
+		"total_lines": strconv.Itoa(totalLines),
 	}
 	if testFile {
 		fileMeta["is_test"] = "true"
@@ -427,7 +433,10 @@ func (g *GoParser) Parse(filePath string, content []byte) (*models.ParseResult, 
 			meta["doc_comment"] = fd.Doc.Text()
 		}
 
-		meta["body"] = byteSlice(content, fset, fd.Pos(), fd.End())
+		// Function bodies used to be embedded here as meta["body"]. That made
+		// graph.json several times larger and gave agents reading the file
+		// raw a tempting fast path that bypassed MCP entirely. Source is
+		// served on demand from disk (file_path + start_line..end_line).
 
 		var nodeType models.NodeType
 		var recvBase string
