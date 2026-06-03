@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Universe/universe/internal/report"
 )
 
 var initPath string
@@ -68,9 +70,18 @@ func runInit(_ *cobra.Command, _ []string) error {
 	}
 	fmt.Printf("   Stored: %s\n", localPath)
 
-	// Drop a Cursor rule that steers the agent to MCP tools instead of
-	// reading .universe/graph.json raw — the file no longer holds source,
-	// but the rule still saves the agent from a wasted exploration step.
+	// Generate UNIVERSE_REPORT.md — a 3-8KB codebase overview the agent
+	// can read once instead of issuing many MCP/shell calls for broad
+	// "what is this codebase" questions.
+	reportPath := filepath.Join(LocalDataDir(), "UNIVERSE_REPORT.md")
+	if err := report.GenerateReport(g, reportPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: couldn't generate report: %v\n", err)
+	} else {
+		fmt.Printf("   Report: %s\n", reportPath)
+	}
+
+	// Drop a Cursor rule that steers the agent to shell commands and the
+	// report file instead of reading .universe/graph.json raw.
 	if wrote, rulePath, err := writeCursorRule(absPath); err == nil && wrote {
 		fmt.Printf("   Cursor rule: %s\n", rulePath)
 	}
@@ -83,9 +94,9 @@ func runInit(_ *cobra.Command, _ []string) error {
 
 	fmt.Println()
 	fmt.Println("Next steps:")
-	fmt.Println("   universe status        Check all engines")
-	fmt.Println("   universe mcp --stdio   Start MCP server for Cursor")
-	fmt.Println("   universe dashboard     Open the dashboard")
+	fmt.Println("   universe status         Check all engines")
+	fmt.Println("   universe mcp --repo .   Start MCP server (Cursor runs this automatically via .cursor/mcp.json)")
+	fmt.Println("   universe dashboard      Open the dashboard")
 
 	_ = os.Stderr // silence unused import if any
 	return nil

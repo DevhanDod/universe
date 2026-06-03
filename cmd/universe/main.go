@@ -29,8 +29,11 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&persistentGraphPath, "graph-file", "",
 		fmt.Sprintf("path to saved graph JSON (default: ./%s)", defaultGraphRel))
 
-	rootCmd.AddCommand(analyzeCmd, queryCmd, statsCmd, graphCmd, mcpCmd, configCmd, dashboardCmd,
+	rootCmd.AddCommand(analyzeCmd, statsCmd, graphCmd, mcpCmd, configCmd, dashboardCmd,
 		initCmd, statusCmd, dbCmd, skillsCmd, languagesCmd)
+	// query, deps, impact, search, recall, skill find/lineage, plans, cost
+	// are registered via init() in their own files (intel.go, recall.go,
+	// skillfind.go, plancli.go).
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -430,95 +433,12 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
-var (
-	queryDependsOn    string
-	queryDependencies string
-	queryType         string
-)
-
-var queryCmd = &cobra.Command{
-	Use:   "query [query]",
-	Short: "Search or filter nodes in the saved graph",
-	RunE:  runQuery,
-}
-
-func runQuery(cmd *cobra.Command, args []string) error {
-	q := ""
-	if len(args) > 0 {
-		q = strings.TrimSpace(args[0])
-	}
-	if queryDependsOn == "" && queryDependencies == "" && q == "" {
-		return fmt.Errorf("provide a search string or --depends-on / --dependencies")
-	}
-
-	g, err := loadGraph(resolvedGraphPath())
-	if err != nil {
-		return err
-	}
-
-	nt, err := parseNodeTypeOptional(queryType)
-	if err != nil {
-		return err
-	}
-
-	w := cmd.OutOrStdout()
-
-	switch {
-	case queryDependsOn != "":
-		targets := findNodesBySubstring(g, queryDependsOn)
-		targets = filterNodeTypeSlice(targets, nt)
-		if len(targets) == 0 {
-			fmt.Fprintf(w, "No nodes matched %q\n", queryDependsOn)
-			return nil
-		}
-		fmt.Fprintf(w, "🔍 Matches for %q (showing dependents)\n\n", queryDependsOn)
-		for _, t := range targets {
-			fmt.Fprintf(w, "✓ %s [%s]\n", t.Name, t.Type)
-			for _, d := range g.GetDependents(t.ID) {
-				fmt.Fprintf(w, "   ↑ %s (%s)\n", d.Name, d.Type)
-			}
-			fmt.Fprintln(w)
-		}
-	case queryDependencies != "":
-		targets := findNodesBySubstring(g, queryDependencies)
-		targets = filterNodeTypeSlice(targets, nt)
-		if len(targets) == 0 {
-			fmt.Fprintf(w, "No nodes matched %q\n", queryDependencies)
-			return nil
-		}
-		fmt.Fprintf(w, "🔍 Matches for %q (showing dependencies)\n\n", queryDependencies)
-		for _, t := range targets {
-			fmt.Fprintf(w, "✓ %s [%s]\n", t.Name, t.Type)
-			for _, d := range g.GetDependencies(t.ID) {
-				fmt.Fprintf(w, "   → %s (%s)\n", d.Name, d.Type)
-			}
-			fmt.Fprintln(w)
-		}
-	default:
-		nodes := g.Search(q)
-		nodes = filterNodeTypeSlice(nodes, nt)
-		if len(nodes) == 0 {
-			fmt.Fprintf(w, "No nodes matched %q\n", q)
-			return nil
-		}
-		fmt.Fprintf(w, "🔍 Results for %q (%d):\n\n", q, len(nodes))
-		sort.Slice(nodes, func(i, j int) bool {
-			if nodes[i].Type != nodes[j].Type {
-				return nodes[i].Type < nodes[j].Type
-			}
-			return nodes[i].Name < nodes[j].Name
-		})
-		for _, n := range nodes {
-			loc := n.FilePath
-			if loc != "" {
-				fmt.Fprintf(w, "✓ %-20s %-10s %s\n", truncate(n.Name, 20), n.Type, loc)
-			} else {
-				fmt.Fprintf(w, "✓ %-20s %s\n", truncate(n.Name, 20), n.Type)
-			}
-		}
-	}
-	return nil
-}
+// The old generic `query` command (search/--depends-on/--dependencies)
+// was removed when we restructured for token economy. Its replacements
+// live in intel.go: `universe query` (360° view), `universe deps`,
+// `universe impact`, `universe search`. Helpers below (truncate,
+// findNodesBySubstring, filterNodeTypeSlice, parseNodeTypeOptional)
+// stayed because other subcommands still use them.
 
 func truncate(s string, max int) string {
 	if len(s) <= max {
@@ -707,10 +627,6 @@ func init() {
 	analyzeCmd.Flags().StringVar(&analyzeFormat, "format", "text", "stdout summary format: json|text")
 	analyzeCmd.Flags().BoolVarP(&analyzeVerbose, "verbose", "v", false, "verbose parsing output")
 	analyzeCmd.Flags().BoolVar(&analyzeIncludeSource, "include-source", true, "include file source content in graph JSON")
-	queryCmd.Args = cobra.MaximumNArgs(1)
-	queryCmd.Flags().StringVar(&queryDependsOn, "depends-on", "", "show nodes that depend on a symbol or package matching this name")
-	queryCmd.Flags().StringVar(&queryDependencies, "dependencies", "", "show outbound dependencies for a matching node")
-	queryCmd.Flags().StringVar(&queryType, "type", "", "filter by node type (e.g. function, package, class)")
 	graphCmd.Flags().StringVarP(&graphOutput, "output", "o", "", "output file (default: stdout)")
 	graphCmd.Flags().StringVar(&graphFormat, "format", "json", "json|dot")
 }
