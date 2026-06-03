@@ -53,6 +53,8 @@ func runInit(_ *cobra.Command, _ []string) error {
 	}
 	stats := g.Stats()
 	fmt.Printf(" %d nodes, %d edges, %d files\n", stats.TotalNodes, stats.TotalEdges, stats.FileCount)
+	fmt.Printf("   Clusters: %d  Flows: %d  Impact nodes: %d\n",
+		len(g.Clusters), len(g.Flows), len(g.Impact))
 
 	if err := EnsureLocalDataDir(); err != nil {
 		return fmt.Errorf("create .universe dir: %w", err)

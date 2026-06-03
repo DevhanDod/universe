@@ -223,6 +223,16 @@ func (a *Analyzer) Analyze(projectPath string) (*graph.Graph, error) {
 	// Stored on the graph so it shows up in Stats().
 	a.graph.SetCoverage(computeCoverage(files))
 
+	// Precompute clusters, flows, and impact summaries. These are stored
+	// on the graph so MCP tools can answer 360° questions in one call
+	// instead of forcing the agent to explore via repeated tool calls.
+	// Order matters: clusters first (flows record cluster names per step),
+	// then flows (impact uses Node.Flows when assessing relevance), then
+	// impact (uses caller counts and flow membership to pick targets).
+	a.graph.SetClusters(DetectClusters(a.graph))
+	a.graph.SetFlows(DetectFlows(a.graph))
+	a.graph.SetImpact(PrecomputeImpact(a.graph))
+
 	if a.verbose {
 		log.Printf("analyzer: files found=%d parsed=%d parse errors=%d", found, parsed, parseErrs)
 	}

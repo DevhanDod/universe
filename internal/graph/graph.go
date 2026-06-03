@@ -15,6 +15,39 @@ type Graph struct {
 	Edges    []*models.Edge              `json:"edges"`
 	Files    map[string]*models.FileInfo `json:"files"`
 	Coverage models.Coverage             `json:"coverage"`
+
+	// Precomputed at index time. MCP tools read these directly so the agent
+	// gets cluster/flow/impact context without follow-up tool calls.
+	Clusters []models.Cluster                  `json:"clusters,omitempty"`
+	Flows    []models.Flow                     `json:"flows,omitempty"`
+	Impact   map[string]*models.ImpactSummary  `json:"impact,omitempty"`
+}
+
+func (g *Graph) SetClusters(c []models.Cluster) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.Clusters = c
+}
+
+func (g *Graph) SetFlows(f []models.Flow) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.Flows = f
+}
+
+func (g *Graph) SetImpact(im map[string]*models.ImpactSummary) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.Impact = im
+}
+
+func (g *Graph) GetImpact(id string) *models.ImpactSummary {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.Impact == nil {
+		return nil
+	}
+	return g.Impact[id]
 }
 
 func (g *Graph) SetCoverage(c models.Coverage) {

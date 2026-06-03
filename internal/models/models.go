@@ -52,6 +52,13 @@ type Node struct {
 	EndLine   int               `json:"end_line"`
 	Signature string            `json:"signature,omitempty"`
 	Metadata  map[string]string `json:"metadata,omitempty"`
+
+	// Precomputed at index time so MCP responses can answer in one call
+	// instead of forcing the agent to explore via repeated tool calls.
+	Cluster     string   `json:"cluster,omitempty"`
+	Flows       []string `json:"flows,omitempty"`
+	CallerCount int      `json:"caller_count,omitempty"`
+	CalleeCount int      `json:"callee_count,omitempty"`
 }
 
 type Edge struct {
@@ -88,6 +95,59 @@ type CoverageBucket struct {
 	FilesParsed int   `json:"files_parsed"`
 	Bytes       int64 `json:"bytes"`
 	BytesParsed int64 `json:"bytes_parsed"`
+}
+
+// Cluster groups related nodes into a functional community (auth, db, tests, …).
+// Computed during `universe init` by label propagation over the call graph.
+type Cluster struct {
+	Name        string   `json:"name"`
+	NodeCount   int      `json:"node_count"`
+	NodeIDs     []string `json:"node_ids,omitempty"`
+	KeyFiles    []string `json:"key_files,omitempty"`
+	EntryPoints []string `json:"entry_points,omitempty"`
+}
+
+// FlowStep is one node visited along an execution flow.
+type FlowStep struct {
+	NodeID  string `json:"node_id"`
+	Name    string `json:"name"`
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Cluster string `json:"cluster,omitempty"`
+	StepNum int    `json:"step_num"`
+}
+
+// Flow is an execution path traced from an entry point (main, handler, test, …).
+type Flow struct {
+	Name       string     `json:"name"`
+	EntryPoint string     `json:"entry_point"`
+	Steps      []FlowStep `json:"steps"`
+	StepCount  int        `json:"step_count"`
+	CrossRepo  bool       `json:"cross_repo,omitempty"`
+	Clusters   []string   `json:"clusters,omitempty"`
+}
+
+// Impact is one node affected by a change to the root node.
+type Impact struct {
+	NodeID     string  `json:"node_id"`
+	Name       string  `json:"name"`
+	File       string  `json:"file"`
+	Line       int     `json:"line"`
+	Confidence float64 `json:"confidence"`
+	Relation   string  `json:"relation,omitempty"`
+}
+
+// ImpactSummary is the precomputed blast radius for one node.
+type ImpactSummary struct {
+	NodeID           string             `json:"node_id"`
+	NodeName         string             `json:"node_name"`
+	TotalAffected    int                `json:"total_affected"`
+	CrossRepo        bool               `json:"cross_repo,omitempty"`
+	RiskLevel        string             `json:"risk_level"`
+	ByDepth          map[int][]Impact   `json:"by_depth"`
+	AffectedFlows    []string           `json:"affected_flows,omitempty"`
+	AffectedClusters []string           `json:"affected_clusters,omitempty"`
+	Summary          string             `json:"summary"`
 }
 
 type ParseResult struct {

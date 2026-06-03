@@ -62,18 +62,33 @@ func RunStdio(ctx context.Context, config ServerConfig) error {
 
 	// Engine 1 — Knowledge Graph
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "get_dependencies",
-		Description: "Get all functions that call or are called by a given function. Returns the dependency tree from the knowledge graph.",
+		Name: "get_context",
+		Description: "PRIMARY tool for code understanding. Returns a 360° view of a " +
+			"function or type in ONE call: callers, callees, execution flows, cluster, " +
+			"and impact summary. Use this FIRST for any \"what does X do / who uses X\" " +
+			"question — you do NOT need to call get_dependencies or get_impact_analysis " +
+			"after this. Compact refs only, no source code.",
+	}, h.HandleGetContext)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "get_dependencies",
+		Description: "Get compact caller/callee refs (name + file:line) for a function. " +
+			"Usually get_context covers this — only call this if you need the full list " +
+			"beyond what get_context returns. Lists are capped at 15 per side.",
 	}, h.HandleGetDependencies)
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "get_impact_analysis",
-		Description: "Analyze what will break if a given function is changed. Returns all affected functions and the risk level.",
+		Name: "get_impact_analysis",
+		Description: "Precomputed blast radius for a planned change: WILL BREAK (direct " +
+			"callers), LIKELY AFFECTED (depth 2), POSSIBLY AFFECTED (depth 3). Use ONLY " +
+			"when planning a change, not for understanding code.",
 	}, h.HandleGetImpactAnalysis)
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "search_graph",
-		Description: "Search the knowledge graph by function name, type name, or package name. Returns matching nodes with their connections.",
+		Name: "search_graph",
+		Description: "Find functions or types by name when you don't know the exact symbol. " +
+			"Returns compact refs with cluster and connection counts. After picking the " +
+			"right match, call get_context for full details.",
 	}, h.HandleSearchGraph)
 
 	// Engine 2 — Persistent Memory
