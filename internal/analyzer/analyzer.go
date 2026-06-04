@@ -223,6 +223,10 @@ func (a *Analyzer) Analyze(projectPath string) (*graph.Graph, error) {
 	// Stored on the graph so it shows up in Stats().
 	a.graph.SetCoverage(computeCoverage(files))
 
+	// Score edges first so cluster/flow/impact passes (and downstream
+	// MCP queries) can filter by confidence.
+	setEdgeConfidence(a.graph)
+
 	// Precompute clusters, flows, and impact summaries. These are stored
 	// on the graph so MCP tools can answer 360° questions in one call
 	// instead of forcing the agent to explore via repeated tool calls.

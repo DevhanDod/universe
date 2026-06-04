@@ -86,6 +86,16 @@ func runInit(_ *cobra.Command, _ []string) error {
 		fmt.Printf("   Cursor rule: %s\n", rulePath)
 	}
 
+	// Generate .cursor/hooks.json — PreToolUse hook that reminds the
+	// agent the graph has data when it's about to Read/Grep/Search.
+	// Skipped if the user already has a hooks.json (they may have
+	// customised it).
+	if wrote, hooksPath, err := writeCursorHooks(absPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: hooks.json: %v\n", err)
+	} else if wrote {
+		fmt.Printf("   Cursor hooks: %s\n", hooksPath)
+	}
+
 	elapsed := time.Since(start).Round(time.Millisecond)
 	fmt.Println()
 	fmt.Println("✅ Graph ready!")

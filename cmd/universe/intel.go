@@ -221,6 +221,53 @@ func runIntelImpact(_ *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// If any scoping flag was set, run a live filtered traversal so
+	// the agent gets exactly the slice it asked for. Otherwise the
+	// precomputed summary from `universe init` is fine.
+	if intelMaxDepth != 3 || intelMinConfidence != 0.5 || intelImpactDir == "downstream" {
+		direction := intelImpactDir
+		if direction == "" {
+			direction = "upstream"
+		}
+		var raw []graph.AffectedNode
+		if direction == "downstream" {
+			raw = g.GetDependenciesFiltered(node.ID, intelMinConfidence, intelMaxDepth)
+		} else {
+			raw = g.GetDependentsFiltered(node.ID, intelMinConfidence, intelMaxDepth)
+		}
+		byDepth := map[int][]models.Impact{}
+		for _, a := range raw {
+			byDepth[a.Depth] = append(byDepth[a.Depth], models.Impact{
+				NodeID: a.Node.ID, Name: a.Node.Name,
+				File: a.Node.FilePath, Line: a.Node.StartLine,
+				Confidence: a.Confidence, Relation: string(a.Relation),
+			})
+		}
+		risk := "low"
+		switch {
+		case len(raw) == 0:
+			risk = "none"
+		case len(raw) > 10:
+			risk = "high"
+		case len(raw) > 5:
+			risk = "medium"
+		}
+		sum := &models.ImpactSummary{
+			NodeID: node.ID, NodeName: node.Name,
+			TotalAffected: len(raw), RiskLevel: risk, ByDepth: byDepth,
+			Summary: fmt.Sprintf("%s affects %d node(s) at depth<=%d conf>=%.2f.",
+				node.Name, len(raw), intelMaxDepth, intelMinConfidence),
+		}
+		fmt.Println(formatNodeRef(node))
+		fmt.Printf("Risk: %s\n", sum.RiskLevel)
+		fmt.Printf("Total affected: %d\n\n", sum.TotalAffected)
+		printImpactBucket("WILL BREAK (depth 1)", sum.ByDepth[1])
+		printImpactBucket("LIKELY AFFECTED (depth 2)", sum.ByDepth[2])
+		printImpactBucket("POSSIBLY AFFECTED (depth 3)", sum.ByDepth[3])
+		fmt.Println(sum.Summary)
+		return nil
+	}
+
 	sum := g.GetImpact(node.ID)
 	// Fall back to a quick BFS for nodes init didn't precompute (low
 	// caller counts). Keeps the command useful for utility helpers.
@@ -366,11 +413,31 @@ func runIntelSearch(_ *cobra.Command, args []string) error {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// scoping flags
+// ──────────────────────────────────────────────────────────────────────
+
+// v0.2.8 added per-edge Confidence so the agent can ask for tightly-
+// scoped traversals. These flags expose that on the shell side; the
+// MCP tools take the same values via JSON input.
+var (
+	intelMaxDepth      int
+	intelMinConfidence float64
+	intelSearchLimit   int
+	intelImpactDir     string
+)
+
+// ──────────────────────────────────────────────────────────────────────
 // registration
 // ──────────────────────────────────────────────────────────────────────
 
 func init() {
 	intelQueryCmd.Use = "query <name>"
+	intelImpactCmd.Flags().IntVar(&intelMaxDepth, "max-depth", 3, "max traversal depth (1-5)")
+	intelImpactCmd.Flags().Float64Var(&intelMinConfidence, "min-confidence", 0.5, "minimum edge confidence (0.0-1.0)")
+	intelImpactCmd.Flags().StringVar(&intelImpactDir, "direction", "upstream", "upstream | downstream")
+	intelDepsCmd.Flags().Float64Var(&intelMinConfidence, "min-confidence", 0.5, "minimum edge confidence (0.0-1.0)")
+	intelSearchCmd.Flags().IntVar(&intelSearchLimit, "limit", 10, "max results (1-25)")
+
 	rootCmd.AddCommand(intelQueryCmd)
 	rootCmd.AddCommand(intelDepsCmd)
 	rootCmd.AddCommand(intelImpactCmd)

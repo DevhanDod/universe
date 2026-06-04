@@ -3,6 +3,7 @@ package graph
 import (
 	"encoding/json"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 
@@ -178,6 +179,149 @@ func (g *Graph) GetEdgesTo(nodeID string) []*models.Edge {
 		if e != nil && e.To == nodeID {
 			out = append(out, e)
 		}
+	}
+	return out
+}
+
+// AffectedNode is one node in a confidence-filtered traversal, with the
+// depth at which it was discovered and the edge confidence that got us
+// here. Used by Get*Filtered to give MCP responses a graded view of the
+// blast radius.
+type AffectedNode struct {
+	Node       *models.Node
+	Depth      int
+	Confidence float64
+	Relation   models.EdgeType
+}
+
+func effectiveConfidence(e *models.Edge) float64 {
+	if e.Confidence <= 0 {
+		// Older graphs (pre-v0.2.8) stored no confidence — treat as
+		// fully trusted so existing data keeps working.
+		return 1.0
+	}
+	return e.Confidence
+}
+
+// GetDependentsFiltered walks reverse edges from nodeID, keeping only
+// edges whose confidence is >= minConfidence, up to maxDepth levels.
+// Returned nodes are sorted by (depth asc, confidence desc).
+func (g *Graph) GetDependentsFiltered(nodeID string, minConfidence float64, maxDepth int) []AffectedNode {
+	return g.bfsFiltered(nodeID, minConfidence, maxDepth, true)
+}
+
+// GetDependenciesFiltered walks forward edges from nodeID (what this node
+// uses), same shape as GetDependentsFiltered.
+func (g *Graph) GetDependenciesFiltered(nodeID string, minConfidence float64, maxDepth int) []AffectedNode {
+	return g.bfsFiltered(nodeID, minConfidence, maxDepth, false)
+}
+
+func (g *Graph) bfsFiltered(nodeID string, minConfidence float64, maxDepth int, reverse bool) []AffectedNode {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if maxDepth <= 0 {
+		maxDepth = 3
+	}
+	visited := map[string]int{nodeID: 0}
+	queue := []string{nodeID}
+	var out []AffectedNode
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		dist := visited[current]
+		if dist >= maxDepth {
+			continue
+		}
+		for _, e := range g.Edges {
+			if e == nil {
+				continue
+			}
+			var nextID string
+			if reverse {
+				if e.To != current || !isDependencyEdge(e.Type) {
+					continue
+				}
+				nextID = e.From
+			} else {
+				if e.From != current {
+					continue
+				}
+				nextID = e.To
+			}
+			conf := effectiveConfidence(e)
+			if conf < minConfidence {
+				continue
+			}
+			if _, seen := visited[nextID]; seen {
+				continue
+			}
+			visited[nextID] = dist + 1
+			queue = append(queue, nextID)
+			if n := g.Nodes[nextID]; n != nil {
+				out = append(out, AffectedNode{
+					Node: n, Depth: dist + 1, Confidence: conf, Relation: e.Type,
+				})
+			}
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Depth != out[j].Depth {
+			return out[i].Depth < out[j].Depth
+		}
+		return out[i].Confidence > out[j].Confidence
+	})
+	return out
+}
+
+// SearchNodes does a relevance-ranked name/file/package search.
+// Used by tools_read.go and tools_unified.go so MCP tools and shell
+// commands share a single sort order.
+func (g *Graph) SearchNodes(query string, limit int) []*models.Node {
+	if limit <= 0 {
+		limit = 10
+	}
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	type ranked struct {
+		n     *models.Node
+		score int
+	}
+	var all []ranked
+	for _, n := range g.Nodes {
+		if n == nil {
+			continue
+		}
+		name := strings.ToLower(n.Name)
+		switch {
+		case name == q:
+			all = append(all, ranked{n, 0})
+		case strings.HasPrefix(name, q):
+			all = append(all, ranked{n, 1})
+		case strings.Contains(name, q):
+			all = append(all, ranked{n, 2})
+		case strings.Contains(strings.ToLower(n.FilePath), q):
+			all = append(all, ranked{n, 3})
+		case strings.Contains(strings.ToLower(n.Package), q):
+			all = append(all, ranked{n, 4})
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].score != all[j].score {
+			return all[i].score < all[j].score
+		}
+		return all[i].n.Name < all[j].n.Name
+	})
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	out := make([]*models.Node, 0, len(all))
+	for _, r := range all {
+		out = append(out, r.n)
 	}
 	return out
 }

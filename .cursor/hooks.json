@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": {
+          "tool_names": ["Read", "ReadFile", "Grep", "Search", "RipGrep", "Glob", "ListFiles"]
+        },
+        "hook": {
+          "type": "command",
+          "command": "universe hook-check \"$TOOL_NAME\" \"$TOOL_INPUT\"",
+          "timeout_ms": 500,
+          "on_failure": "ignore"
+        }
+      }
+    ]
+  }
+}

@@ -66,6 +66,16 @@ type Edge struct {
 	To       string            `json:"to"`
 	Type     EdgeType          `json:"type"`
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	// Confidence score for this relationship.
+	//   1.0  — same file, AST-extracted
+	//   0.9  — cross-file within same package
+	//   0.8  — cross-package, resolved via import
+	//   0.6  — cross-package, name-based match
+	//   0.5  — external / unresolved target
+	//   0.0  — not set; readers MUST treat as 1.0 for backward
+	//          compatibility with graphs built before v0.2.8.
+	Confidence float64 `json:"confidence,omitempty"`
 }
 
 // FileInfo stores the full content of a source file for visualization

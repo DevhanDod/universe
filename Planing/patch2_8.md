@@ -1,0 +1,1357 @@
+# Universe v0.2.8 — Token Optimization Patch
+
+## Build Specification for Claude Code
+
+**Version:** 0.2.8  
+**Problem:** Universe connected via MCP uses 154K tokens. Without Universe, the same question costs ~90K. Universe ADDS 64K tokens instead of saving them.  
+**Root cause:** 5 write-only MCP tools add schema overhead every turn. 12 read tools are shell commands the agent ignores. No hooks enforce graph-first behavior. Compression engine is a library nothing calls at query time. Cursor rule says "skip Universe when local" — agent bypasses the system entirely.  
+**Solution:** Swap MCP tools (reads become MCP, writes become shell). Add unified `context` tool. Add PreToolUse hooks. Rewrite cursor rule. Wire compression into the response path.  
+**Expected result:** 25-35K tokens for structural questions. Under 60K for complex cross-file questions. Always below the 90K naive baseline.  
+**References:** Graphify (PreToolUse hooks, graph-first steering) and GitNexus (precomputed relational intelligence, unified tools).
+
+---
+
+## 1. Change Summary
+
+| Change | What | Why | Token Impact |
+|--------|------|-----|-------------|
+| 1 | Swap MCP tools — reads to MCP, writes to shell | Agent sees useful tools, not write-only ones it never calls | -4K/turn schema, +useful tools |
+| 2 | Add unified `context` MCP tool | One call chains graph + memory + skills + compression | Replaces 3-10 file reads per question |
+| 3 | Add PreToolUse hook | Intercepts file reads, redirects to graph | -15K to -30K per question |
+| 4 | Rewrite `universe.mdc` | Graph-first, not graph-optional | Prevents agent from bypassing system |
+| 5 | Wire compression into response path | All MCP responses pass through shorthand formatter | -20% per tool response |
+| 6 | Add confidence scores to edges | Enables scoped queries with `--min-confidence` | Tighter responses, fewer false positives |
+| 7 | Add `--max-depth` and `--min-confidence` flags | Agent can request exactly what it needs | Prevents over-fetching |
+
+---
+
+## 2. Current State (v0.2.7)
+
+```
+MCP tools (5, all writes):
+  store_observation          → Engine 2 write
+  report_skill_execution     → Engine 3 write
+  store_plan                 → Engine 5 write
+  store_plan_result          → Engine 5 write
+  verify_plan                → Engine 5 write
+
+Shell commands (12, all reads):
+  universe query <name>      → Engine 1 read
+  universe deps <name>       → Engine 1 read
+  universe impact <name>     → Engine 1 read
+  universe search <term>     → Engine 1 read
+  universe recall <query>    → Engine 2 read
+  universe skill find <q>    → Engine 3 read
+  universe skill list        → Engine 3 read
+  universe skill lineage <id>→ Engine 3 read
+  universe plan get          → Engine 5 read
+  universe plan result <id>  → Engine 5 read
+  universe cost              → Engine 5 read
+  universe status            → meta
+
+Hooks: none
+Cursor rule: "skip Universe when the file is local"
+Compression: library exists, nothing calls it at query time
+```
+
+---
+
+## 3. Target State (v0.2.8)
+
+```
+MCP tools (6, all reads + 1 unified):
+  universe_context           → NEW — unified: graph + memory + skills + compress
+  universe_query             → Engine 1 read (moved FROM shell)
+  universe_impact            → Engine 1 read (moved FROM shell)
+  universe_search            → Engine 1 read (moved FROM shell)
+  universe_recall            → Engine 2 read (moved FROM shell)
+  universe_skill_find        → Engine 3 read (moved FROM shell)
+
+Shell commands (7, all writes + rarely-used reads):
+  universe store-observation → Engine 2 write (moved FROM MCP)
+  universe report-skill      → Engine 3 write (moved FROM MCP)
+  universe store-plan        → Engine 5 write (moved FROM MCP)
+  universe store-plan-result → Engine 5 write (moved FROM MCP)
+  universe verify-plan       → Engine 5 write (moved FROM MCP)
+  universe deps <name>       → Engine 1 read (stays shell, rarely needed)
+  universe cost              → Engine 5 read (stays shell, rarely needed)
+  universe status            → meta (stays shell)
+  universe skill list        → Engine 3 read (stays shell, rarely needed)
+  universe skill lineage <id>→ Engine 3 read (stays shell, rarely needed)
+  universe plan get          → Engine 5 read (stays shell)
+  universe plan result <id>  → Engine 5 read (stays shell)
+
+Hooks: PreToolUse (intercepts Read, Grep, Search → redirects to graph)
+Cursor rule: "ALWAYS query Universe first. Read files ONLY when graph says so."
+Compression: wired into every MCP read tool response
+```
+
+---
+
+## 4. File Changes
+
+### 4.1 New Files
+
+```
+internal/mcpserver/tools_unified.go     — unified context tool handler
+internal/mcpserver/tools_read.go        — read tool handlers (query, impact, search, recall, skill_find)
+internal/mcpserver/response.go          — response formatting + compression layer
+cmd/universe/store_cmds.go              — shell commands for write operations
+.cursor/hooks.json                      — PreToolUse hook configuration (generated by universe init)
+```
+
+### 4.2 Modified Files
+
+```
+internal/mcpserver/server.go            — swap tool registrations
+internal/models/models.go               — add Confidence field to Edge
+internal/graph/graph.go                 — add confidence-filtered queries
+internal/analyzer/analyzer.go           — set confidence scores during extraction
+cmd/universe/intel.go                   — add --max-depth, --min-confidence flags
+cmd/universe/cursor_rule.go             — rewrite the generated universe.mdc
+cmd/universe/init_cmd.go                — generate .cursor/hooks.json during init
+```
+
+### 4.3 Deleted Files
+
+```
+internal/mcpserver/tools_memory.go      — replaced by tools_read.go
+internal/mcpserver/tools_skills.go      — replaced by tools_read.go
+internal/mcpserver/tools_orchestrator.go— write handlers move to shell, reads to tools_read.go
+```
+
+---
+
+## 5. File: `internal/mcpserver/response.go` (NEW)
+
+### Purpose
+
+Central response formatting layer. Every MCP read tool response passes through here before returning to the agent. Applies compression, enforces token budgets, and formats as compact text.
+
+```go
+package mcpserver
+
+import (
+    "fmt"
+    "strings"
+
+    "universe/internal/compress"
+    "universe/internal/graph"
+    "universe/internal/models"
+)
+
+// ResponseConfig controls how tool responses are formatted.
+type ResponseConfig struct {
+    // MaxTokens is the approximate token budget for the response.
+    // Default: 500. Hard max: 2000.
+    MaxTokens int
+
+    // IncludeFlows includes execution flow names in the response.
+    IncludeFlows bool
+
+    // IncludeImpact includes impact summary (caller/callee counts).
+    IncludeImpact bool
+
+    // CompressionLevel controls shorthand formatting.
+    // Default: compress.LevelCompact
+    CompressionLevel compress.CompressionLevel
+}
+
+// DefaultResponseConfig returns the default configuration.
+// Every tool should use this unless it has a specific reason to override.
+func DefaultResponseConfig() ResponseConfig {
+    return ResponseConfig{
+        MaxTokens:        500,
+        IncludeFlows:     true,
+        IncludeImpact:    true,
+        CompressionLevel: compress.LevelCompact,
+    }
+}
+
+// FormatNodeResponse formats a single graph node for MCP tool output.
+// This is the canonical format — every tool uses this for node references.
+//
+// Output format (one line per node, ~40-60 tokens per node):
+//
+//   Name [type] file:line (cluster) [confidence%]
+//   Callers: name1, name2, name3
+//   Callees: name4, name5
+//   Flows: flowA, flowB
+//   Impact: high — 12 affected node(s)
+//
+// The compression layer replaces verbose descriptions with graph shorthand.
+// Example: "the ValidateToken function in auth/validate.go which is called by
+// 3 other functions" becomes "auth.ValidateToken → 3 callers"
+func FormatNodeResponse(node *models.Node, g *graph.Graph, cfg ResponseConfig) string {
+    // Implementation:
+    // 1. Build the header line: Name [type] file:line (cluster)
+    // 2. If cfg.IncludeImpact: add Callers/Callees lines (capped at 10 each)
+    // 3. If cfg.IncludeFlows: add Flows line
+    // 4. If node has CallerCount >= 3 or flows >= 2: add Impact summary line
+    // 5. Pass through compress.BuildShorthand() with cfg.CompressionLevel
+    // 6. If result exceeds cfg.MaxTokens (~4 chars per token estimate):
+    //    truncate callers/callees lists, add "...and N more"
+    // 7. Return plain text string (no JSON, no markdown)
+    var b strings.Builder
+    // ... implementation
+    return b.String()
+}
+
+// FormatNodeList formats multiple nodes as a compact list.
+// Used by search, impact, and the unified context tool.
+// Applies the same per-node format, with a summary header.
+//
+// Output format:
+//
+//   Found 4 results for "validateToken":
+//
+//   1. ValidateToken [function] auth/validate.go:42 (auth) [95%]
+//      Callers: LoginHandler, RefreshHandler, TestAuth
+//      Flows: LoginFlow, RefreshFlow
+//
+//   2. validateTokenHelper [function] auth/helpers.go:18 (auth) [85%]
+//      ...
+//
+func FormatNodeList(nodes []*models.Node, g *graph.Graph, query string, cfg ResponseConfig) string {
+    // Implementation:
+    // 1. Write header: "Found N results for "query":"
+    // 2. For each node (up to 15, controlled by intelMaxList):
+    //    a. Call FormatNodeResponse(node, g, cfg)
+    //    b. Number it
+    // 3. If truncated: add "...and N more results"
+    // 4. Total response must stay under cfg.MaxTokens
+    var b strings.Builder
+    // ... implementation
+    return b.String()
+}
+
+// FormatImpactResponse formats blast radius analysis.
+// Used by the impact tool and the unified context tool.
+//
+// Output format:
+//
+//   Target: ValidateToken [function] auth/validate.go:42
+//   Risk: HIGH — 12 affected nodes across 3 clusters
+//
+//   WILL BREAK (depth 1, confidence >= 90%):
+//     LoginHandler [function] api/auth.go:45 [95%]
+//     RefreshHandler [function] api/token.go:78 [92%]
+//
+//   LIKELY AFFECTED (depth 2, confidence >= 70%):
+//     authRouter [file] routes/auth.go [75%]
+//
+//   POSSIBLY AFFECTED (depth 3, confidence >= 50%):
+//     ...
+//
+func FormatImpactResponse(target *models.Node, affected []AffectedNode, cfg ResponseConfig) string {
+    var b strings.Builder
+    // ... implementation
+    return b.String()
+}
+
+// AffectedNode represents a node in the blast radius with metadata.
+type AffectedNode struct {
+    Node       *models.Node
+    Depth      int
+    Confidence float64 // 0.0 to 1.0
+    Relation   string  // "calls", "imports", "implements", etc.
+}
+```
+
+---
+
+## 6. File: `internal/mcpserver/tools_unified.go` (NEW)
+
+### Purpose
+
+The unified `universe_context` MCP tool. This is the primary tool the agent should call for any code question. It chains graph + memory + skills + compression into one response.
+
+```go
+package mcpserver
+
+import (
+    "context"
+    "fmt"
+    "strings"
+
+    "universe/internal/compress"
+    "universe/internal/graph"
+    "universe/internal/memory"
+    "universe/internal/skills"
+)
+
+// ContextInput is the input schema for the universe_context tool.
+// The MCP SDK auto-generates the JSON schema from these struct tags.
+type ContextInput struct {
+    // Name is the symbol, function, type, or concept to look up.
+    // Can be a full qualified name ("analyzer.NewAnalyzer") or just "NewAnalyzer".
+    Name string `json:"name" description:"Symbol, function, type, or concept to look up"`
+
+    // Question is an optional natural language question.
+    // When provided, the tool searches more broadly and includes memory/skills.
+    // When omitted, the tool does an exact name lookup in the graph.
+    Question string `json:"question,omitempty" description:"Optional natural language question for broader search"`
+
+    // MaxDepth controls how many levels of callers/callees to include.
+    // Default: 2. Max: 5.
+    MaxDepth int `json:"max_depth,omitempty" description:"Depth of caller/callee traversal (default 2, max 5)"`
+
+    // MinConfidence filters relationships below this threshold.
+    // Default: 0.5. Range: 0.0 to 1.0.
+    MinConfidence float64 `json:"min_confidence,omitempty" description:"Minimum confidence threshold for relationships (default 0.5)"`
+
+    // IncludeMemory controls whether to search developer memory.
+    // Default: true.
+    IncludeMemory bool `json:"include_memory,omitempty" description:"Include relevant observations from memory (default true)"`
+
+    // IncludeSkills controls whether to search for matching skills.
+    // Default: true.
+    IncludeSkills bool `json:"include_skills,omitempty" description:"Include matching skill recipes (default true)"`
+}
+
+// HandleContext is the handler for the universe_context MCP tool.
+//
+// This is the primary tool. The agent calls this FIRST for any code question.
+// It returns a unified response combining:
+//   - Graph: the node, its callers, callees, flows, cluster, impact
+//   - Memory: relevant observations from past sessions (if any)
+//   - Skills: matching skill recipes (if any)
+//   - All compressed through the shorthand formatter
+//
+// The response is compact plain text, typically 300-600 tokens.
+//
+// Example response:
+//
+//   === GRAPH ===
+//   NewAnalyzer [function] internal/analyzer/analyzer.go:36 (analyzer) [100%]
+//   Callers: buildAnalyzer (main.go:74), loadOrBuildGraph (mcp_cmd.go:154)
+//   Callees: Analyzer, parser.Registry, extractor.Extractor, Config, Scanner
+//   Flows: runAnalyze, runMCP
+//   Impact: medium — 4 affected nodes
+//
+//   === MEMORY ===
+//   [May 28] Refactored NewAnalyzer to accept Config struct instead of individual params.
+//            Had to update both callers in main.go and mcp_cmd.go.
+//
+//   === SKILL ===
+//   "analyzer-refactor" (v2, 90% success): When modifying analyzer init,
+//   always update both cmd/universe/main.go and cmd/universe/mcp_cmd.go.
+//
+func (h *Handlers) HandleContext(ctx context.Context, input ContextInput) (string, error) {
+    // Implementation:
+    //
+    // 1. Set defaults
+    if input.MaxDepth == 0 {
+        input.MaxDepth = 2
+    }
+    if input.MinConfidence == 0 {
+        input.MinConfidence = 0.5
+    }
+
+    var sections []string
+
+    // 2. Graph lookup
+    //    a. If input.Name is provided: exact node lookup via graph.GetNode()
+    //    b. If not found or input.Question is provided: search via graph.Search()
+    //    c. For the top result, get callers/callees filtered by MinConfidence
+    //    d. Get flows, cluster, impact summary
+    //    e. Format via FormatNodeResponse()
+    //    f. Append to sections as "=== GRAPH ===\n" + formatted
+
+    // 3. Memory lookup (if input.IncludeMemory, default true)
+    //    a. Search memory for input.Name or input.Question
+    //    b. Limit to top 3 observations
+    //    c. Format each as: "[date] summary" (one line per observation)
+    //    d. If no results: skip this section entirely (don't say "no memory found")
+    //    e. Append to sections as "=== MEMORY ===\n" + formatted
+
+    // 4. Skill lookup (if input.IncludeSkills, default true)
+    //    a. Search skills for input.Name or input.Question
+    //    b. If match found: format as skill name, version, success rate, instruction preview
+    //    c. If no match: skip this section entirely
+    //    d. Append to sections as "=== SKILL ===\n" + formatted
+
+    // 5. Compress the combined response
+    //    a. Join all sections with "\n\n"
+    //    b. Pass through compress.BuildShorthand() with LevelCompact
+    //    c. Enforce 800-token budget — truncate memory/skills before graph if needed
+
+    // 6. Return the compressed string
+
+    return strings.Join(sections, "\n\n"), nil
+}
+```
+
+---
+
+## 7. File: `internal/mcpserver/tools_read.go` (NEW)
+
+### Purpose
+
+Individual read tool handlers for agents that need specific data rather than the unified context.
+
+```go
+package mcpserver
+
+import (
+    "context"
+)
+
+// QueryInput is the input schema for the universe_query tool.
+type QueryInput struct {
+    Name string `json:"name" description:"Symbol or function name to look up"`
+}
+
+// HandleQuery returns compact context for a single symbol.
+// This is the same as what `universe query <name>` returns via shell,
+// but as an MCP tool so the agent can call it without shell overhead.
+//
+// Returns: compact text, ~180 tokens. Same format as v0.2.7 shell output.
+func (h *Handlers) HandleQuery(ctx context.Context, input QueryInput) (string, error) {
+    // Implementation:
+    // 1. Look up node in graph by name
+    // 2. If not found: return "No node found for '<name>'. Try universe_search."
+    // 3. Format via FormatNodeResponse() with DefaultResponseConfig()
+    // 4. Return plain text
+    return "", nil
+}
+
+// ImpactInput is the input schema for the universe_impact tool.
+type ImpactInput struct {
+    Name         string  `json:"name" description:"Symbol to analyze blast radius for"`
+    Direction    string  `json:"direction,omitempty" description:"'upstream' (what depends on this) or 'downstream' (what this depends on). Default: upstream"`
+    MaxDepth     int     `json:"max_depth,omitempty" description:"How many levels deep to trace (default 3, max 5)"`
+    MinConfidence float64 `json:"min_confidence,omitempty" description:"Minimum confidence threshold (default 0.5)"`
+}
+
+// HandleImpact returns blast radius analysis for a symbol.
+// Shows what breaks if you change this symbol, grouped by depth and confidence.
+//
+// Returns: structured text, ~200-500 tokens depending on connectivity.
+func (h *Handlers) HandleImpact(ctx context.Context, input ImpactInput) (string, error) {
+    // Implementation:
+    // 1. Set defaults: direction="upstream", maxDepth=3, minConfidence=0.5
+    // 2. Look up target node
+    // 3. BFS traversal filtering by minConfidence
+    // 4. Group results by depth
+    // 5. Format via FormatImpactResponse()
+    // 6. Return plain text
+    return "", nil
+}
+
+// SearchInput is the input schema for the universe_search tool.
+type SearchInput struct {
+    Query string `json:"query" description:"Search term — matches against node names, file paths, and packages"`
+    Limit int    `json:"limit,omitempty" description:"Max results (default 10, max 25)"`
+}
+
+// HandleSearch returns matching nodes from the graph.
+//
+// Returns: compact list, ~100-400 tokens.
+func (h *Handlers) HandleSearch(ctx context.Context, input SearchInput) (string, error) {
+    // Implementation:
+    // 1. Set defaults: limit=10
+    // 2. Search graph by name, file path, package (case-insensitive substring match)
+    // 3. Sort by relevance (exact match > prefix match > substring match)
+    // 4. Format via FormatNodeList()
+    // 5. Return plain text
+    return "", nil
+}
+
+// RecallInput is the input schema for the universe_recall tool.
+type RecallInput struct {
+    Query string `json:"query" description:"What to search for in memory — a concept, function name, or description of a past fix"`
+    Node  string `json:"node,omitempty" description:"Filter to observations tagged to this graph node"`
+    Limit int    `json:"limit,omitempty" description:"Max observations to return (default 5)"`
+}
+
+// HandleRecall returns relevant observations from developer memory.
+//
+// Returns: compact text, ~100-300 tokens.
+func (h *Handlers) HandleRecall(ctx context.Context, input RecallInput) (string, error) {
+    // Implementation:
+    // 1. Set defaults: limit=5
+    // 2. Search memory via memory.Retriever (hybrid: BM25 + vector + graph node)
+    // 3. Format each observation as: "[date] category: summary"
+    // 4. If input.Node provided: filter to observations tagged to that node
+    // 5. Apply compression shorthand
+    // 6. Return plain text
+    return "", nil
+}
+
+// SkillFindInput is the input schema for the universe_skill_find tool.
+type SkillFindInput struct {
+    Query string `json:"query" description:"What you're trying to do — the skill matcher finds relevant recipes"`
+}
+
+// HandleSkillFind returns the best matching skill recipe.
+//
+// Returns: compact text, ~50-200 tokens.
+func (h *Handlers) HandleSkillFind(ctx context.Context, input SkillFindInput) (string, error) {
+    // Implementation:
+    // 1. Search skills via skills.Matcher
+    // 2. If match found: return skill name, version, success rate, instruction text (truncated to 150 tokens)
+    // 3. If no match: return "No matching skill found."
+    // 4. Apply compression shorthand
+    // 5. Return plain text
+    return "", nil
+}
+```
+
+---
+
+## 8. File: `internal/mcpserver/server.go` (MODIFY)
+
+### Changes
+
+Remove the 5 write tool registrations. Add 6 read tool registrations.
+
+```go
+// ================================================================
+// REMOVE these 5 tool registrations:
+// ================================================================
+
+// REMOVE: mcp.AddTool(server, &mcp.Tool{Name: "store_observation", ...
+// REMOVE: mcp.AddTool(server, &mcp.Tool{Name: "report_skill_execution", ...
+// REMOVE: mcp.AddTool(server, &mcp.Tool{Name: "store_plan", ...
+// REMOVE: mcp.AddTool(server, &mcp.Tool{Name: "store_plan_result", ...
+// REMOVE: mcp.AddTool(server, &mcp.Tool{Name: "verify_plan", ...
+
+// ================================================================
+// ADD these 6 tool registrations:
+// ================================================================
+
+// PRIMARY TOOL — the agent should call this first for any code question
+mcp.AddTool(server, &mcp.Tool{
+    Name:        "universe_context",
+    Description: "Get complete context for a symbol or question. Combines knowledge graph (structure, callers, callees, flows, impact), developer memory (past fixes, patterns), and skill recipes into one response. Call this FIRST before reading any source files.",
+}, h.HandleContext)
+
+// SPECIFIC TOOLS — for when the agent needs targeted data
+mcp.AddTool(server, &mcp.Tool{
+    Name:        "universe_query",
+    Description: "Quick lookup: get callers, callees, flows, and impact for a specific symbol name. Faster than universe_context when you know the exact name and don't need memory/skills.",
+}, h.HandleQuery)
+
+mcp.AddTool(server, &mcp.Tool{
+    Name:        "universe_impact",
+    Description: "Blast radius analysis: what breaks if you change this symbol? Returns affected nodes grouped by depth and confidence level. Use before making changes.",
+}, h.HandleImpact)
+
+mcp.AddTool(server, &mcp.Tool{
+    Name:        "universe_search",
+    Description: "Search the knowledge graph by name, file path, or package. Returns matching symbols with their context. Use when you don't know the exact symbol name.",
+}, h.HandleSearch)
+
+mcp.AddTool(server, &mcp.Tool{
+    Name:        "universe_recall",
+    Description: "Search developer memory for past observations — fixes, patterns, decisions. Returns relevant memories from previous coding sessions.",
+}, h.HandleRecall)
+
+mcp.AddTool(server, &mcp.Tool{
+    Name:        "universe_skill_find",
+    Description: "Find a skill recipe that matches what you're trying to do. Returns step-by-step instructions from past successful patterns.",
+}, h.HandleSkillFind)
+```
+
+### Handlers struct update
+
+```go
+// Update the Handlers struct to include all engine dependencies:
+type Handlers struct {
+    Graph       *graph.Graph
+    Memory      *memory.Store
+    Retriever   *memory.Retriever
+    Skills      *skills.Store
+    SkillMatch  *skills.Matcher
+    Compressor  *compress.Compressor // NEW — used by response.go
+}
+```
+
+---
+
+## 9. File: `cmd/universe/store_cmds.go` (NEW)
+
+### Purpose
+
+Shell commands for write operations that were previously MCP tools.
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/spf13/cobra"
+)
+
+// storeObservationCmd creates the `universe store-observation` command.
+// Replaces the store_observation MCP tool.
+//
+// Usage:
+//   universe store-observation --category fix --summary "Fixed type mismatch" --node "auth.ValidateToken"
+//   universe store-observation --category pattern --summary "Always check nil before dereference" --shared
+//
+// Flags:
+//   --category  string  Observation category: fix, pattern, decision, discovery (required)
+//   --summary   string  What happened, in one sentence (required)
+//   --node      string  Graph node ID to tag this observation to (optional)
+//   --detail    string  Full detail text (optional, reads from stdin if "-")
+//   --shared    bool    Make this observation visible to the team (default false)
+//
+// Implementation:
+//   1. Parse flags
+//   2. If --detail is "-": read from stdin
+//   3. Connect to PostgreSQL (same DB URL as MCP server)
+//   4. Call memory.Store.StoreObservation()
+//   5. Print: "Stored observation <id> tagged to <node>"
+func storeObservationCmd() *cobra.Command {
+    // ... cobra command definition
+    return cmd
+}
+
+// reportSkillCmd creates the `universe report-skill` command.
+// Replaces the report_skill_execution MCP tool.
+//
+// Usage:
+//   universe report-skill --skill-id abc123 --success --output "Fixed the type mismatch"
+//   universe report-skill --skill-id abc123 --failure --error "Skill instruction was outdated"
+//
+// Flags:
+//   --skill-id  string  Skill ID (required)
+//   --success   bool    Skill worked
+//   --failure   bool    Skill failed
+//   --output    string  What happened (optional)
+//   --error     string  What went wrong (optional, only with --failure)
+//
+// Implementation:
+//   1. Parse flags, validate exactly one of --success/--failure
+//   2. Connect to PostgreSQL
+//   3. Call skills.Executor.ReportExecution()
+//   4. Print acknowledgment
+func reportSkillCmd() *cobra.Command {
+    return nil
+}
+
+// storePlanCmd creates the `universe store-plan` command.
+// Replaces the store_plan MCP tool.
+//
+// Usage:
+//   universe store-plan --from-stdin    (reads JSON plan from stdin)
+//   universe store-plan --task "Fix auth" --steps "1. Update validate.go\n2. Update tests"
+//
+// Implementation:
+//   1. Parse input (stdin JSON or flags)
+//   2. Connect to PostgreSQL
+//   3. Call orchestrator.StorePlan()
+//   4. Print: "Stored plan <id>"
+func storePlanCmd() *cobra.Command {
+    return nil
+}
+
+// storePlanResultCmd creates the `universe store-plan-result` command.
+// Replaces the store_plan_result MCP tool.
+//
+// Usage:
+//   universe store-plan-result --plan-id abc123 --status done --summary "All steps completed"
+//
+func storePlanResultCmd() *cobra.Command {
+    return nil
+}
+
+// verifyPlanCmd creates the `universe verify-plan` command.
+// Replaces the verify_plan MCP tool.
+//
+// Usage:
+//   universe verify-plan --plan-id abc123 --approve
+//   universe verify-plan --plan-id abc123 --reject --reason "Missing test coverage"
+//
+func verifyPlanCmd() *cobra.Command {
+    return nil
+}
+
+// registerStoreCommands adds all write commands to the root cobra command.
+// Called from main.go during CLI setup.
+//
+// Adds:
+//   universe store-observation
+//   universe report-skill
+//   universe store-plan
+//   universe store-plan-result
+//   universe verify-plan
+func registerStoreCommands(root *cobra.Command) {
+    root.AddCommand(storeObservationCmd())
+    root.AddCommand(reportSkillCmd())
+    root.AddCommand(storePlanCmd())
+    root.AddCommand(storePlanResultCmd())
+    root.AddCommand(verifyPlanCmd())
+}
+```
+
+---
+
+## 10. File: `internal/models/models.go` (MODIFY)
+
+### Add confidence to Edge
+
+```go
+// FIND the Edge struct and ADD the Confidence field:
+
+type Edge struct {
+    From     string            `json:"from"`
+    To       string            `json:"to"`
+    Type     EdgeType          `json:"type"`
+    Metadata map[string]string `json:"metadata,omitempty"`
+
+    // NEW: Confidence score for this relationship.
+    // 1.0 = AST-extracted (tree-sitter found it directly)
+    // 0.9 = resolved cross-file within same package
+    // 0.8 = resolved cross-package within same repo
+    // 0.5 = inferred (e.g., name-based matching, unresolved external)
+    // 0.0 = not set (treat as 1.0 for backward compatibility)
+    Confidence float64 `json:"confidence,omitempty"`
+}
+```
+
+---
+
+## 11. File: `internal/graph/graph.go` (MODIFY)
+
+### Add confidence-filtered queries
+
+```go
+// ADD these methods to the Graph struct:
+
+// GetDependentsFiltered returns nodes that depend on the given node,
+// filtered by minimum confidence.
+// This replaces GetDependents for MCP tool use.
+//
+// Parameters:
+//   - nodeID: the target node
+//   - minConfidence: minimum edge confidence (0.0 to 1.0)
+//   - maxDepth: how many levels to traverse (1 = direct only)
+//
+// Returns: slice of AffectedNode with depth and confidence metadata.
+func (g *Graph) GetDependentsFiltered(nodeID string, minConfidence float64, maxDepth int) []AffectedNode {
+    // Implementation:
+    // 1. BFS from nodeID, following reverse edges (edges where To == nodeID)
+    // 2. At each level, only follow edges with Confidence >= minConfidence
+    // 3. Track depth for each discovered node
+    // 4. Stop at maxDepth
+    // 5. Return results sorted by depth ASC, then confidence DESC
+    // 6. Edge.Confidence == 0.0 is treated as 1.0 (backward compat with old graphs)
+    return nil
+}
+
+// GetDependenciesFiltered returns nodes that this node depends on,
+// filtered by minimum confidence.
+func (g *Graph) GetDependenciesFiltered(nodeID string, minConfidence float64, maxDepth int) []AffectedNode {
+    // Same as GetDependentsFiltered but follows forward edges (edges where From == nodeID)
+    return nil
+}
+
+// SearchNodes searches for nodes matching a query string.
+// Matches against Name, FilePath, and Package (case-insensitive).
+// Returns results sorted by relevance:
+//   1. Exact name match
+//   2. Prefix match on name
+//   3. Substring match on name
+//   4. File path match
+//   5. Package match
+//
+// Parameters:
+//   - query: search string
+//   - limit: max results (default 10)
+func (g *Graph) SearchNodes(query string, limit int) []*models.Node {
+    return nil
+}
+```
+
+---
+
+## 12. File: `internal/analyzer/analyzer.go` (MODIFY)
+
+### Set confidence scores during extraction
+
+```go
+// MODIFY the edge creation logic in the analyzer.
+// After building edges from tree-sitter extraction, set confidence scores.
+//
+// Add this function and call it after all edges are created:
+
+// setEdgeConfidence assigns confidence scores to all edges based on
+// how they were resolved.
+//
+// Rules:
+//   - Same file, AST-extracted:           1.0
+//   - Cross-file, same package:           0.9
+//   - Cross-package, resolved by import:  0.8
+//   - Cross-package, name-based match:    0.6
+//   - External/stdlib (unresolved target): 0.5
+//   - Contains edges (file→function):     1.0
+//   - Import edges:                       1.0
+//
+func setEdgeConfidence(g *graph.Graph) {
+    for _, edge := range g.Edges {
+        if edge == nil {
+            continue
+        }
+        fromNode := g.Nodes[edge.From]
+        toNode := g.Nodes[edge.To]
+        if fromNode == nil || toNode == nil {
+            edge.Confidence = 0.5
+            continue
+        }
+
+        switch {
+        case edge.Type == models.EdgeContains || edge.Type == models.EdgeImports:
+            edge.Confidence = 1.0
+        case fromNode.FilePath == toNode.FilePath:
+            edge.Confidence = 1.0
+        case fromNode.Package == toNode.Package:
+            edge.Confidence = 0.9
+        case toNode.Package != "" && fromNode.Package != toNode.Package:
+            // Cross-package — check if resolved via import
+            if hasImportEdge(g, fromNode, toNode) {
+                edge.Confidence = 0.8
+            } else {
+                edge.Confidence = 0.6
+            }
+        default:
+            edge.Confidence = 0.5
+        }
+    }
+}
+
+// hasImportEdge checks if fromNode's file has an import edge to toNode's package.
+func hasImportEdge(g *graph.Graph, from, to *models.Node) bool {
+    for _, e := range g.Edges {
+        if e.Type == models.EdgeImports && e.From == from.ID {
+            target := g.Nodes[e.To]
+            if target != nil && target.Package == to.Package {
+                return true
+            }
+        }
+    }
+    return false
+}
+```
+
+Call `setEdgeConfidence(g)` at the end of `analyzer.Analyze()`, after all edges are built but before writing `graph.json`.
+
+---
+
+## 13. File: `cmd/universe/intel.go` (MODIFY)
+
+### Add `--max-depth` and `--min-confidence` flags
+
+```go
+// MODIFY the existing shell commands to accept scoping flags.
+//
+// For universe query:
+//   Add: --max-depth int (default 2)
+//   Add: --min-confidence float64 (default 0.5)
+//
+// For universe impact:
+//   Add: --max-depth int (default 3)
+//   Add: --min-confidence float64 (default 0.5)
+//   Add: --direction string (default "upstream", options: "upstream", "downstream", "both")
+//
+// For universe search:
+//   Add: --limit int (default 10, max 25)
+//
+// For universe deps:
+//   Add: --min-confidence float64 (default 0.5)
+//
+// These flags pass through to the new filtered graph methods.
+// Shell output format stays the same — compact text, no JSON.
+```
+
+---
+
+## 14. File: `cmd/universe/cursor_rule.go` (MODIFY)
+
+### Rewrite the generated `universe.mdc`
+
+Replace the entire `cursorRuleContent` string with:
+
+```go
+const cursorRuleContent = `---
+description: Universe Knowledge Graph — graph-first code intelligence
+globs:
+alwaysApply: true
+---
+
+# Universe — Graph-First Code Intelligence
+
+You have access to Universe MCP tools that provide a precomputed knowledge graph
+of this codebase. The graph knows every function, caller, callee, execution flow,
+and cluster — plus developer memory and skill recipes.
+
+## CRITICAL RULE: Always Query the Graph First
+
+For ANY question about code structure, dependencies, or relationships:
+
+1. Call universe_context with the symbol name or question FIRST
+2. The response contains callers, callees, flows, impact, memory, and skills
+3. ONLY read source files if:
+   - The graph says "No node found" (symbol not in graph)
+   - You need the EXACT source code for a specific function the graph identified
+   - The question is about file content (comments, formatting), not structure
+4. When you do read a file, read ONLY the specific function/lines the graph pointed to — NOT the entire file
+
+## NEVER do these when Universe tools are available:
+- Grep the entire codebase to find callers (use universe_impact instead)
+- Read 5+ files to trace a call chain (use universe_context instead)
+- Search file-by-file for dependencies (use universe_search instead)
+- Open a file just to see what functions it contains (use universe_query instead)
+
+## Tool selection guide:
+
+| Question type | Tool to use | Example |
+|---|---|---|
+| "What is X? What calls X?" | universe_context | universe_context(name: "ValidateToken") |
+| "What breaks if I change X?" | universe_impact | universe_impact(name: "ValidateToken", direction: "upstream") |
+| "Find functions related to auth" | universe_search | universe_search(query: "auth") |
+| "Did we fix this before?" | universe_recall | universe_recall(query: "type mismatch in auth") |
+| "Is there a recipe for this?" | universe_skill_find | universe_skill_find(query: "fix type mismatch") |
+
+## Write operations (use shell commands, not MCP):
+
+` + "`" + `universe store-observation --category fix --summary "..." --node "..."` + "`" + `
+` + "`" + `universe report-skill --skill-id <id> --success` + "`" + `
+` + "`" + `universe store-plan --from-stdin` + "`" + `
+
+## When to skip Universe:
+
+- Editing a file you already have open (just edit it)
+- Creating new files from scratch (nothing in the graph yet)
+- Running tests, builds, or other shell commands
+- The question has nothing to do with code structure
+`
+```
+
+---
+
+## 15. File: `.cursor/hooks.json` (NEW — generated by `universe init`)
+
+### Purpose
+
+PreToolUse hook that intercepts file reads and grep operations, reminding the agent to check the graph first.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": {
+          "tool_names": ["Read", "ReadFile", "Grep", "Search", "RipGrep", "Glob", "ListFiles"]
+        },
+        "hook": {
+          "type": "command",
+          "command": "universe hook-check \"$TOOL_NAME\" \"$TOOL_INPUT\"",
+          "timeout_ms": 500,
+          "on_failure": "ignore"
+        }
+      }
+    ]
+  }
+}
+```
+
+### File: `cmd/universe/hook_cmd.go` (NEW)
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "os"
+    "strings"
+
+    "github.com/spf13/cobra"
+)
+
+// hookCheckCmd creates the `universe hook-check` command.
+// Called by Cursor's PreToolUse hook before Read/Grep/Search operations.
+//
+// This command:
+//   1. Parses the tool name and input from Cursor
+//   2. Extracts the symbol or file path being accessed
+//   3. Checks if the graph has relevant data for this symbol
+//   4. If yes: prints a brief reminder to use Universe tools instead
+//   5. If no: prints nothing (lets the file read proceed)
+//
+// The output is injected into the agent's context by Cursor.
+// It must be fast (< 500ms) and short (< 100 tokens).
+//
+// Usage (called automatically by Cursor, not by the developer):
+//   universe hook-check "Read" '{"file_path": "internal/auth/validate.go"}'
+//   universe hook-check "Grep" '{"pattern": "ValidateToken"}'
+//
+func hookCheckCmd() *cobra.Command {
+    cmd := &cobra.Command{
+        Use:    "hook-check [tool_name] [tool_input_json]",
+        Short:  "PreToolUse hook — checks if graph can answer before file read",
+        Hidden: true, // Not for developer use
+        Args:   cobra.ExactArgs(2),
+        RunE: func(cmd *cobra.Command, args []string) error {
+            toolName := args[0]
+            toolInput := args[1]
+
+            // 1. Load graph (fast — it's a JSON file, ~50ms for 8K edges)
+            g, err := loadGraph()
+            if err != nil {
+                // Graph not available — let the file read proceed silently
+                return nil
+            }
+
+            // 2. Extract the relevant symbol or path from tool input
+            symbol := extractSymbolFromToolInput(toolName, toolInput)
+            if symbol == "" {
+                return nil // Can't determine what's being accessed
+            }
+
+            // 3. Check if graph has data for this symbol
+            nodes := g.SearchNodes(symbol, 3)
+            if len(nodes) == 0 {
+                return nil // Graph doesn't know about this — let file read proceed
+            }
+
+            // 4. Print a brief reminder (injected into agent context by Cursor)
+            // Keep this VERY short — it's added to every intercepted tool call
+            fmt.Fprintf(os.Stdout,
+                "[Universe] Graph has data for '%s' (%d nodes). "+
+                    "Consider calling universe_context(name: \"%s\") instead of reading files.\n",
+                symbol, len(nodes), nodes[0].Name,
+            )
+
+            return nil
+        },
+    }
+    return cmd
+}
+
+// extractSymbolFromToolInput extracts a searchable symbol name from
+// Cursor's tool input JSON.
+//
+// For Read/ReadFile: extracts filename, strips path, strips extension
+//   '{"file_path": "internal/auth/validate.go"}' → "validate"
+//
+// For Grep/Search/RipGrep: extracts the search pattern
+//   '{"pattern": "ValidateToken"}' → "ValidateToken"
+//
+// For Glob/ListFiles: extracts directory name
+//   '{"pattern": "internal/auth/*"}' → "auth"
+//
+func extractSymbolFromToolInput(toolName, inputJSON string) string {
+    var input map[string]interface{}
+    if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
+        return ""
+    }
+
+    switch toolName {
+    case "Read", "ReadFile":
+        if fp, ok := input["file_path"].(string); ok {
+            // Extract filename without extension
+            parts := strings.Split(fp, "/")
+            name := parts[len(parts)-1]
+            name = strings.TrimSuffix(name, ".go")
+            name = strings.TrimSuffix(name, ".py")
+            return name
+        }
+    case "Grep", "Search", "RipGrep":
+        if p, ok := input["pattern"].(string); ok {
+            return p
+        }
+        if p, ok := input["query"].(string); ok {
+            return p
+        }
+    case "Glob", "ListFiles":
+        if p, ok := input["pattern"].(string); ok {
+            parts := strings.Split(strings.TrimSuffix(p, "/*"), "/")
+            return parts[len(parts)-1]
+        }
+    }
+    return ""
+}
+
+// loadGraph loads the graph from .universe/graph.json.
+// Returns nil error if graph doesn't exist (hook should be silent).
+func loadGraph() (*graph.Graph, error) {
+    // Implementation: same as existing graph loading in intel.go
+    // Read .universe/graph.json, unmarshal, return
+    return nil, nil
+}
+```
+
+---
+
+## 16. File: `cmd/universe/init_cmd.go` (MODIFY)
+
+### Add hook generation to `universe init`
+
+```go
+// AFTER the existing init logic (graph build, cluster, flows, report generation),
+// ADD hook file generation:
+
+// generateHooksFile creates .cursor/hooks.json if it doesn't exist.
+// Called at the end of `universe init`.
+//
+// Does NOT overwrite if the file already exists — developer may have
+// customized their hooks.
+func generateHooksFile(projectDir string) error {
+    hooksPath := filepath.Join(projectDir, ".cursor", "hooks.json")
+
+    // Don't overwrite existing hooks
+    if _, err := os.Stat(hooksPath); err == nil {
+        fmt.Println("  .cursor/hooks.json already exists — skipping")
+        return nil
+    }
+
+    // Create .cursor/ directory if needed
+    if err := os.MkdirAll(filepath.Dir(hooksPath), 0755); err != nil {
+        return err
+    }
+
+    hooksContent := `{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": {
+          "tool_names": ["Read", "ReadFile", "Grep", "Search", "RipGrep", "Glob", "ListFiles"]
+        },
+        "hook": {
+          "type": "command",
+          "command": "universe hook-check \"$TOOL_NAME\" \"$TOOL_INPUT\"",
+          "timeout_ms": 500,
+          "on_failure": "ignore"
+        }
+      }
+    ]
+  }
+}`
+
+    if err := os.WriteFile(hooksPath, []byte(hooksContent), 0644); err != nil {
+        return err
+    }
+
+    fmt.Println("  Created .cursor/hooks.json (PreToolUse hook for graph-first steering)")
+    return nil
+}
+```
+
+Add the call at the end of the init command's RunE:
+
+```go
+// At the end of init_cmd.go RunE, after generateCursorRule():
+if err := generateHooksFile(projectDir); err != nil {
+    fmt.Printf("  Warning: could not create hooks file: %v\n", err)
+    // Non-fatal — hooks are optional enhancement
+}
+```
+
+---
+
+## 17. Register New Commands in `main.go`
+
+```go
+// In cmd/universe/main.go, add to the root command setup:
+
+// Add the hook-check command (hidden, called by Cursor hooks)
+rootCmd.AddCommand(hookCheckCmd())
+
+// Add write commands (moved from MCP)
+registerStoreCommands(rootCmd)
+```
+
+---
+
+## 18. Migration: Update `graph.json` Format
+
+The `Confidence` field is added to edges. Existing graphs (v0.2.7) have `confidence: 0` which is treated as `1.0` for backward compatibility.
+
+When `universe init` runs on a v0.2.8 binary against an existing project:
+1. It rebuilds the graph as usual
+2. `setEdgeConfidence()` runs and assigns scores
+3. The new `graph.json` includes confidence values
+4. Old `graph.json` files still work — `Confidence == 0` is treated as `1.0`
+
+No database migration needed. The graph is a JSON file, not a schema.
+
+---
+
+## 19. Testing
+
+### Test 1: MCP tool count
+
+```bash
+# Start MCP server and verify tool count
+universe mcp --stdio
+# Send initialize request, check that exactly 6 tools are registered:
+#   universe_context, universe_query, universe_impact,
+#   universe_search, universe_recall, universe_skill_find
+```
+
+### Test 2: Unified context tool
+
+```bash
+# From Cursor, call the context tool:
+# universe_context(name: "NewAnalyzer")
+#
+# Expected response (~400 tokens):
+#   === GRAPH ===
+#   NewAnalyzer [function] internal/analyzer/analyzer.go:36 (analyzer) [100%]
+#   Callers: buildAnalyzer (main.go:74), loadOrBuildGraph (mcp_cmd.go:154)
+#   ...
+#   === MEMORY ===
+#   (any relevant observations, or section omitted if none)
+#   === SKILL ===
+#   (any relevant skills, or section omitted if none)
+```
+
+### Test 3: Hook interception
+
+```bash
+# In Cursor, try to grep for a function that exists in the graph:
+# grep "NewAnalyzer"
+#
+# Expected: hook fires, prints:
+# [Universe] Graph has data for 'NewAnalyzer' (1 nodes).
+# Consider calling universe_context(name: "NewAnalyzer") instead of reading files.
+#
+# The agent should then call universe_context instead of proceeding with grep.
+```
+
+### Test 4: Token comparison (THE critical test)
+
+```bash
+# Fresh Cursor chat WITH Universe v0.2.8:
+# Ask: "What calls NewAnalyzer and what would break if I changed its signature?"
+# Note total token count → TARGET: under 40K
+
+# Fresh Cursor chat WITHOUT Universe:
+# Same question
+# Note total token count → BASELINE: ~90K
+
+# Universe MUST use FEWER tokens than without Universe.
+# If it doesn't, something is wrong — check:
+#   - Is the agent calling universe_context or still grepping?
+#   - Is the hook firing?
+#   - Are MCP tool schemas reasonable size? (check with universe mcp --stdio)
+```
+
+### Test 5: Write commands work from shell
+
+```bash
+universe store-observation --category fix --summary "Test observation" --node "analyzer:analyzer.go:NewAnalyzer"
+# Should print: "Stored observation <id> tagged to analyzer:analyzer.go:NewAnalyzer"
+
+universe report-skill --skill-id test123 --success --output "Skill worked"
+# Should print acknowledgment
+```
+
+### Test 6: Confidence filtering
+
+```bash
+universe impact NewAnalyzer --min-confidence 0.8
+# Should show only high-confidence relationships
+
+universe impact NewAnalyzer --min-confidence 0.0
+# Should show all relationships including inferred ones
+```
+
+### Test 7: Backward compatibility
+
+```bash
+# Copy a v0.2.7 graph.json (without confidence scores) into .universe/
+# Run: universe query NewAnalyzer
+# Should work normally — confidence 0.0 treated as 1.0
+```
+
+---
+
+## 20. Acceptance Criteria
+
+- [ ] MCP server registers exactly 6 read tools (not 5 write tools)
+- [ ] `universe_context` returns combined graph + memory + skills response
+- [ ] `universe_context` response is under 800 tokens for a typical node
+- [ ] `universe_query` matches existing shell output format
+- [ ] `universe_impact` supports `--max-depth` and `--min-confidence`
+- [ ] All MCP responses pass through compression layer
+- [ ] Write operations work as shell commands: `store-observation`, `report-skill`, `store-plan`, `store-plan-result`, `verify-plan`
+- [ ] `.cursor/hooks.json` generated during `universe init`
+- [ ] Hook fires before Read/Grep/Search and prints graph reminder
+- [ ] Hook completes in under 500ms
+- [ ] Hook is silent when graph has no data for the symbol
+- [ ] Updated `universe.mdc` says "always query graph first"
+- [ ] `universe.mdc` no longer says "skip Universe when local"
+- [ ] Edge confidence scores assigned during `universe init`
+- [ ] Old graphs (confidence=0) still work (backward compatible)
+- [ ] Token usage WITH Universe is LOWER than without Universe
+- [ ] Token usage for structural questions is under 40K
+- [ ] Token usage for complex cross-file questions is under 60K
+- [ ] All existing shell read commands still work (`universe query`, `deps`, `impact`, etc.)
+
+---
+
+## 21. What NOT to Build in This Patch
+
+- Do NOT add new parsers or languages — extraction quality is a separate issue
+- Do NOT modify the dashboard — it reads from the same data, no changes needed
+- Do NOT change the graph storage format (still JSON file) — database migration is a future patch
+- Do NOT add PostgreSQL dependency for the hook — it reads graph.json directly for speed
+- Do NOT implement streaming MCP responses — batch is fine for responses under 800 tokens
+- Do NOT build PostToolUse hooks — PreToolUse is sufficient for v0.2.8
+- Do NOT modify Engine 5 (orchestrator) internals — only the MCP↔shell swap
+- Do NOT add HTTP transport to MCP — stdio is the only transport needed
+
+---
+
+## 22. Implementation Order
+
+Build in this order to maintain a working system at each step:
+
+1. **`internal/models/models.go`** — add Confidence field to Edge (backward compatible, nothing breaks)
+2. **`internal/graph/graph.go`** — add filtered query methods (new methods, nothing existing changes)
+3. **`internal/analyzer/analyzer.go`** — add `setEdgeConfidence()` (runs at end of init, existing behavior unchanged)
+4. **`internal/mcpserver/response.go`** — new file, response formatting layer
+5. **`internal/mcpserver/tools_unified.go`** — new file, unified context tool
+6. **`internal/mcpserver/tools_read.go`** — new file, individual read tools
+7. **`internal/mcpserver/server.go`** — swap registrations (remove 5 writes, add 6 reads)
+8. **`cmd/universe/store_cmds.go`** — new file, shell write commands
+9. **`cmd/universe/hook_cmd.go`** — new file, PreToolUse hook handler
+10. **`cmd/universe/cursor_rule.go`** — rewrite the rule content
+11. **`cmd/universe/init_cmd.go`** — add hook file generation
+12. **`cmd/universe/main.go`** — register new commands
+13. **`cmd/universe/intel.go`** — add scoping flags
+14. **Delete** `tools_memory.go`, `tools_skills.go`, `tools_orchestrator.go`
+15. **Test** — run all 7 tests from Section 19
+
+---
+
+## 23. Token Budget Reference
+
+Expected token costs per component after this patch:
+
+| Component | Tokens | Notes |
+|-----------|--------|-------|
+| Cursor system prompt + built-in tools | ~18K | Cannot change — Cursor controls this |
+| MCP tool schemas (6 read tools) | ~5K | Down from ~4K writes + ~5K Cursor injected schemas |
+| universe.mdc (always-apply rule) | ~2K | Down from ~5-8K (rewritten to be shorter) |
+| Hook output (per interception) | ~50 | Only fires when graph has data |
+| universe_context response | ~400 | Combined graph + memory + skills, compressed |
+| universe_query response | ~180 | Single node lookup |
+| universe_impact response | ~300 | Blast radius with depth grouping |
+| File read (when needed) | ~500 | Only the specific function, not the whole file |
+
+**Typical structural question total: ~26K**
+(18K Cursor fixed + 5K schemas + 2K rule + 50 hook + 400 context + 500 synthesis)
+
+**Typical complex question total: ~28K**
+(18K Cursor fixed + 5K schemas + 2K rule + 50 hook + 400 context + 300 impact + 180 query + 1K synthesis)
+
+**Worst case (graph can't answer, falls back to files): ~50K**
+(18K Cursor fixed + 5K schemas + 2K rule + 50 hook + 400 context + 5K file reads + 1K synthesis)
+
+All targets are well below the 90K naive baseline.
