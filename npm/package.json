@@ -1,6 +1,6 @@
 {
   "name": "@devhand/universe",
-  "version": "0.2.8",
+  "version": "0.3.0",
   "description": "Universe — AI token optimization platform for Cursor with 5 engines: Knowledge Graph, Persistent Memory, Self-Evolving Skills, Compression, and Plan-Bridge",
   "keywords": [
     "cursor",
