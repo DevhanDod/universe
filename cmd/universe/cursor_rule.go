@@ -98,26 +98,33 @@ func universeHookCommand() string {
 	return quoted + " hook-check \"$TOOL_NAME\" \"$TOOL_INPUT\""
 }
 
-// renderHooksBody returns the .cursor/hooks.json contents with the
-// command line baked to the absolute path of the universe binary.
+// renderHooksBody returns the .cursor/hooks.json contents in Cursor's
+// documented schema: https://cursor.com/docs/hooks.md
+//
+//   { "version": 1,
+//     "hooks": {
+//       "preToolUse": [
+//         { "command": "./binary args", "matcher": "Read|Grep|..." }
+//       ]
+//     } }
+//
+// Versions before v0.3.3 shipped a schema invented from Claude Code's
+// hook docs (PascalCase event key, matcher-as-object, command nested
+// under "hook"); Cursor silently rejected the whole file. That is the
+// reason the hook never fired in chat despite the binary working
+// perfectly when invoked by hand.
 func renderHooksBody() string {
 	cmd := universeHookCommand()
-	// Embed `cmd` (already a JSON string literal from strconv.Quote)
-	// directly into the JSON document — using fmt.Sprintf instead of
-	// templating to keep dependencies minimal.
+	// Matcher is a regex Cursor evaluates against the tool name; we
+	// list every Read/Grep-style tool we want to intercept.
+	matcher := "Read|ReadFile|Grep|Search|RipGrep|Glob|ListFiles"
 	return `{
+  "version": 1,
   "hooks": {
-    "PreToolUse": [
+    "preToolUse": [
       {
-        "matcher": {
-          "tool_names": ["Read", "ReadFile", "Grep", "Search", "RipGrep", "Glob", "ListFiles"]
-        },
-        "hook": {
-          "type": "command",
-          "command": ` + jsonString(cmd) + `,
-          "timeout_ms": 500,
-          "on_failure": "ignore"
-        }
+        "command": ` + jsonString(cmd) + `,
+        "matcher": ` + jsonString(matcher) + `
       }
     ]
   }
