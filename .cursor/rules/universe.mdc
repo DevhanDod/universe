@@ -1,66 +1,55 @@
 ---
-description: "Universe knowledge graph — graph-first code intelligence"
-globs: ["**/*"]
+description: "Universe knowledge graph — hook-delivered, no MCP tools"
 alwaysApply: true
 ---
 
-# Universe — Graph-First Code Intelligence
+# Universe — Hook-Delivered Code Intelligence
 
-This project has a precomputed knowledge graph (callers, callees, flows,
-clusters, impact) exposed via Universe MCP tools, plus a summary at
-.universe/UNIVERSE_REPORT.md.
+Universe gives you a precomputed knowledge graph of this codebase
+(callers, callees, flows, clusters, impact, confidence) automatically
+through Cursor's PreToolUse hook. There is no tool to call.
 
-## CRITICAL: Query the graph FIRST
+## How it works
 
-For ANY question about code structure, callers, callees, impact, or
-"what does X do":
+When you Read / Grep / Search a symbol, the hook checks the graph
+BEFORE the tool runs and prints the answer into your context. You will
+see a block like:
 
-1. Call universe_context first with the symbol or question.
-2. The response covers graph + memory + skills in one shot.
-3. Only Read source files if:
-   - universe_context returns "No node found" for the symbol, or
-   - You need the exact source body of a function the graph located, or
-   - The question is about literal file contents (comments, formatting).
-4. When you do Read a file, read ONLY the line range the graph pointed at,
-   not the whole file.
+  [Universe] ErrorResponse [struct] test-server.go:58 (test_server)
+  Callers (1): sendError [method] test-server.go:563
+  Flows: handleRequest
+  Impact: low — 1 affected node(s)
+  Confidence: all relationships ≥90%
+  Graph has complete context. File read is likely unnecessary.
 
-## DO NOT
+## What to do with hook output
 
-- Do NOT Grep / Read across the codebase before calling universe_context.
-- Do NOT chain universe_query + universe_impact when universe_context
-  already includes both.
-- Do NOT read .universe/graph.json directly — it's structural-only and
-  reading it costs more than any answer it could give.
-- Do NOT skip Universe because "the question feels local" — call it
-  anyway; the graph response is small and tells you whether the rest of
-  the codebase is involved.
+- "File read is likely unnecessary" (confidence ≥80%) — SKIP the file
+  read entirely. The graph answered the question.
+- "Targeted file read may help verify" (confidence 50–80%) — Read ONLY
+  the line range the hook showed (e.g. test-server.go:58–66), not the
+  whole file.
+- No hook output — graph has no data for this symbol; proceed normally.
 
-## MCP read tools (call these)
+## Shell commands (optional, on demand)
 
-- universe_context(name, [question, max_depth, min_confidence])
-  PRIMARY tool. Graph + memory + skills, one response.
-- universe_query(name)
-  Quick lookup: just the graph slice for one symbol.
-- universe_impact(name, [direction, max_depth, min_confidence])
-  Blast radius. direction = "upstream" (default) or "downstream".
-- universe_search(query, [limit])
-  Find symbols by name / file path / package.
-- universe_recall(query, [node, limit])
-  Past observations from memory.
-- universe_skill_find(query)
-  Match a skill recipe (always REQUIRES VERIFICATION before use).
+- universe query <name>    same data as the hook, on demand
+- universe impact <name>   blast radius (--max-depth, --min-confidence)
+- universe search <term>   find symbols by name / path / package
+- universe deps <name>     direct callers + callees
+- universe recall <query>  past observations from memory
 
-## Shell write commands (NOT MCP tools — run via Bash)
+## Write commands (shell, structured input)
 
 - universe store-observation --category <fix|pattern|decision> --summary "..." [--node ID]
-- universe report-skill --skill-id <id> --success|--failure [--output ...] [--error ...]
+- universe report-skill --skill-id <id> --success|--failure
 - universe store-plan --title "..." --step "1. ..." --step "2. ..."
 - universe store-plan-result --plan-id <id> --success [--summary ...]
 - universe verify-plan --plan-id <id> --approve|--reject [--note ...]
 
-## When to skip Universe entirely
+## DO NOT
 
-- Editing a file you already have open and the question is purely about
-  that file's literal text.
-- Creating brand-new files (graph has nothing yet).
-- Shell / build / test invocations.
+- Do NOT read .universe/graph.json directly. It is large and structural;
+  the hook gives you what you need.
+- Do NOT read entire files when the hook gave you a line range.
+- Do NOT call a Universe MCP tool — there is no MCP server anymore.

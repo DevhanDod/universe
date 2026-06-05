@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -97,6 +98,35 @@ func MaskPassword(url string) string {
 // ── Local data dir ────────────────────────────────────────────────────────────
 
 func LocalDataDir() string { return ".universe" }
+
+// loadDotEnv copies KEY=VALUE pairs from a .env file into the current
+// process environment if the key is not already set. Used by commands
+// (dashboard, init, etc.) that want UNIVERSE_DB_URL / DATABASE_URL from
+// the project root without forcing the user to export them. Originally
+// lived in mcp_cmd.go; kept here after MCP was removed in v0.3.0.
+func loadDotEnv(path string) {
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		val = strings.Trim(strings.TrimSpace(val), `"'`)
+		if key != "" && os.Getenv(key) == "" {
+			_ = os.Setenv(key, val)
+		}
+	}
+}
 
 func EnsureLocalDataDir() error { return os.MkdirAll(LocalDataDir(), 0o755) }
 

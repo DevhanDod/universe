@@ -7,20 +7,23 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/Universe/universe/internal/hookengine"
 )
 
-// universe hook-check — invoked by .cursor/hooks.json before the
-// agent runs Read/Grep/Search-style tools. If the graph already has
-// data for whatever symbol the tool is about to touch, we print a
-// short reminder pointing at universe_context.
+// universe hook-check — invoked by .cursor/hooks.json before the agent
+// runs Read/Grep/Search-style tools. v0.3.0 makes the hook deliver the
+// complete graph answer (callers, callees, flows, impact, confidence)
+// directly into the agent's context, rather than a one-line "consider
+// using X instead" nudge. The goal is to make the file read unnecessary
+// when the graph already covers the question, the same model Graphify
+// uses.
 //
-// The hook is silent when:
-//   - the graph isn't built yet (universe init never ran)
-//   - the target can't be extracted from the tool input
-//   - no matching node exists in the graph
-//
-// Silent on failure is deliberate — a hook that breaks the user's
-// tool calls would be worse than no hook at all.
+// Silent cases (intentional — the tool call should proceed normally):
+//   - Graph not built yet (no .universe/graph.json)
+//   - Tool input doesn't yield a queryable symbol
+//   - Graph has no node matching the symbol
+//   - Confidence is too low to trust the graph answer
 
 var hookCheckCmd = &cobra.Command{
 	Use:    "hook-check <tool_name> <tool_input_json>",
@@ -40,7 +43,7 @@ func runHookCheck(_ *cobra.Command, args []string) error {
 
 	g, err := loadGraph(filepath.Join(LocalDataDir(), "graph.json"))
 	if err != nil {
-		return nil // silent — no graph yet
+		return nil
 	}
 
 	symbol := extractSymbolFromToolInput(toolName, toolInput)
@@ -48,22 +51,36 @@ func runHookCheck(_ *cobra.Command, args []string) error {
 		return nil
 	}
 
-	nodes := g.SearchNodes(symbol, 1)
-	if len(nodes) == 0 {
+	res := hookengine.Query(g, symbol)
+	if !res.NodeFound {
 		return nil
 	}
-	first := nodes[0]
-	fmt.Printf("[Universe] Graph has data for %q (e.g. %s [%s] %s:%d). "+
-		"Consider universe_context(name: %q) instead of %s.\n",
-		symbol, first.Name, first.Type, first.FilePath, first.StartLine,
-		first.Name, toolName)
+
+	// Lead with a tag so the agent can recognize and trust the block —
+	// the cursor rule references the same "[Universe]" prefix.
+	fmt.Printf("[Universe] %s", res.Response)
+
+	// Confidence band determines how strongly we tell the agent to skip
+	// the file read. The thresholds match GitNexus's convention: 0.8 is
+	// the cutoff for "trust this directly", 0.5 is the floor for "look
+	// but verify".
+	switch {
+	case res.MinConfidence >= 0.8:
+		fmt.Printf("Confidence: all relationships ≥%.0f%%\n", res.MinConfidence*100)
+		fmt.Println("Graph has complete context. File read is likely unnecessary.")
+	case res.MinConfidence >= 0.5:
+		fmt.Printf("Confidence: some relationships are %.0f%% (inferred).\n", res.MinConfidence*100)
+		fmt.Println("Graph has partial context. Targeted file read may help verify.")
+	}
+	// minConf < 0.5: don't print a guidance line — let the agent read
+	// the file without our recommendation. The graph data is still
+	// above, which is itself useful context.
 	return nil
 }
 
 // extractSymbolFromToolInput pulls a searchable name out of the JSON
-// payload Cursor sends to the hook. We try a few common keys per tool
-// (file_path / pattern / query) because the exact schema varies by
-// Cursor version and tool implementation.
+// payload Cursor sends to the hook. Different tools use different keys
+// (file_path vs path, pattern vs query) so we try a small list per tool.
 func extractSymbolFromToolInput(toolName, inputJSON string) string {
 	var input map[string]interface{}
 	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {

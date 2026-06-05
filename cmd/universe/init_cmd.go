@@ -105,8 +105,12 @@ func runInit(_ *cobra.Command, _ []string) error {
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Println("   universe status         Check all engines")
-	fmt.Println("   universe mcp --repo .   Start MCP server (Cursor runs this automatically via .cursor/mcp.json)")
+	fmt.Println("   universe query <name>   Look up a symbol on demand")
 	fmt.Println("   universe dashboard      Open the dashboard")
+	fmt.Println()
+	fmt.Println("Cursor delivers the graph automatically through the PreToolUse")
+	fmt.Println("hook in .cursor/hooks.json. Remove any \"universe\" entry from")
+	fmt.Println(".cursor/mcp.json — v0.3.0 has no MCP server.")
 
 	_ = os.Stderr // silence unused import if any
 	return nil
