@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -12,18 +13,35 @@ import (
 )
 
 // universe hook-check — invoked by .cursor/hooks.json before the agent
-// runs Read/Grep/Search-style tools. v0.3.0 makes the hook deliver the
-// complete graph answer (callers, callees, flows, impact, confidence)
-// directly into the agent's context, rather than a one-line "consider
-// using X instead" nudge. The goal is to make the file read unnecessary
-// when the graph already covers the question, the same model Graphify
-// uses.
+// runs Read/Grep/Search-style tools. The exit channel for talking back
+// to Cursor is a JSON document on stdout matching its PreToolUse hook
+// protocol; plain text is silently ignored, which is why earlier hook
+// versions appeared to "do nothing" inside the chat.
 //
-// Silent cases (intentional — the tool call should proceed normally):
-//   - Graph not built yet (no .universe/graph.json)
-//   - Tool input doesn't yield a queryable symbol
-//   - Graph has no node matching the symbol
-//   - Confidence is too low to trust the graph answer
+// Response schema (Cursor PreToolUse):
+//
+//   {
+//     "permission":    "allow" | "deny",
+//     "user_message":  "<shown to the developer; optional>",
+//     "agent_message": "<injected into the agent's context; optional>"
+//   }
+//
+// Decision logic, by graph state:
+//
+//   no graph / no symbol / no match     → permission=allow, empty body
+//   graph hit, min confidence >= 0.8    → permission=deny, agent_message=full block
+//   graph hit, min confidence  < 0.8    → permission=allow, agent_message=full block + hint
+//
+// The deny path is the win: the file read never happens, no convention
+// rules auto-attach, and the agent has the graph answer in its context.
+// The allow-with-context path is a softer assist for cross-package
+// relationships we don't fully trust.
+
+type hookResponse struct {
+	Permission   string `json:"permission"`
+	UserMessage  string `json:"user_message,omitempty"`
+	AgentMessage string `json:"agent_message,omitempty"`
+}
 
 var hookCheckCmd = &cobra.Command{
 	Use:    "hook-check <tool_name> <tool_input_json>",
@@ -41,41 +59,77 @@ func runHookCheck(_ *cobra.Command, args []string) error {
 	toolName := args[0]
 	toolInput := args[1]
 
+	// Default response: allow the tool through, say nothing. We fall
+	// back to this whenever the graph isn't available, the input is
+	// unparseable, or no matching symbol exists. The agent's normal
+	// Read/Grep path proceeds untouched.
+	allow := hookResponse{Permission: "allow"}
+
 	g, err := loadGraph(filepath.Join(LocalDataDir(), "graph.json"))
 	if err != nil {
-		return nil
+		return emitJSON(allow)
 	}
-
 	symbol := extractSymbolFromToolInput(toolName, toolInput)
 	if symbol == "" {
-		return nil
+		return emitJSON(allow)
 	}
-
 	res := hookengine.Query(g, symbol)
 	if !res.NodeFound {
-		return nil
+		return emitJSON(allow)
 	}
 
-	// Lead with a tag so the agent can recognize and trust the block —
-	// the cursor rule references the same "[Universe]" prefix.
-	fmt.Printf("[Universe] %s", res.Response)
+	// Format the graph block once; both deny and soft-allow include it
+	// as agent_message. Leading "[Universe] " tag matches the cursor
+	// rule's example so the agent recognizes the source.
+	block := "[Universe] " + strings.TrimRight(res.Response, "\n")
 
-	// Confidence band determines how strongly we tell the agent to skip
-	// the file read. The thresholds match GitNexus's convention: 0.8 is
-	// the cutoff for "trust this directly", 0.5 is the floor for "look
-	// but verify".
 	switch {
 	case res.MinConfidence >= 0.8:
-		fmt.Printf("Confidence: all relationships ≥%.0f%%\n", res.MinConfidence*100)
-		fmt.Println("Graph has complete context. File read is likely unnecessary.")
+		// High-trust path: block the read. Include the exact line range
+		// so the agent has a precise escape hatch — it can choose to
+		// override by reading the narrow slice rather than the file.
+		lineHint := ""
+		if res.StartLine > 0 && res.EndLine >= res.StartLine {
+			lineHint = fmt.Sprintf(
+				"\n\nIf the source body is essential, read ONLY %s lines %d-%d.",
+				res.FilePath, res.StartLine, res.EndLine)
+		}
+		agentMsg := block +
+			fmt.Sprintf("\nConfidence: all relationships ≥%.0f%%\n", res.MinConfidence*100) +
+			"Graph has complete context. File read blocked — graph already answered." +
+			lineHint
+		return emitJSON(hookResponse{
+			Permission:   "deny",
+			UserMessage:  fmt.Sprintf("Universe graph answered %q — file read skipped.", symbol),
+			AgentMessage: agentMsg,
+		})
+
 	case res.MinConfidence >= 0.5:
-		fmt.Printf("Confidence: some relationships are %.0f%% (inferred).\n", res.MinConfidence*100)
-		fmt.Println("Graph has partial context. Targeted file read may help verify.")
+		// Medium-trust path: give the agent the data but let the tool
+		// run too. The convention-rule cost still applies but at least
+		// the agent has structural context as it reads.
+		agentMsg := block +
+			fmt.Sprintf("\nConfidence: some relationships are %.0f%% (inferred). ",
+				res.MinConfidence*100) +
+			"Targeted file read may help verify."
+		return emitJSON(hookResponse{
+			Permission:   "allow",
+			AgentMessage: agentMsg,
+		})
+
+	default:
+		// Low confidence — silent allow. The graph has data but the
+		// relationships are guesses; surfacing them would mislead.
+		return emitJSON(allow)
 	}
-	// minConf < 0.5: don't print a guidance line — let the agent read
-	// the file without our recommendation. The graph data is still
-	// above, which is itself useful context.
-	return nil
+}
+
+// emitJSON writes the response as a single JSON object on stdout.
+// Cursor expects exactly one document, no trailing newline noise; we
+// keep it compact and let json.Encoder add the line terminator.
+func emitJSON(r hookResponse) error {
+	enc := json.NewEncoder(os.Stdout)
+	return enc.Encode(r)
 }
 
 // extractSymbolFromToolInput pulls a searchable name out of the JSON
