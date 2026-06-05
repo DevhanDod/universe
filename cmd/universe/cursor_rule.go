@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 // cursorRuleBody is the steering rule we drop into the user's project so
@@ -66,12 +67,45 @@ see a block like:
 - Do NOT call a Universe MCP tool — there is no MCP server anymore.
 `
 
-// cursorHooksBody is the .cursor/hooks.json contents written by
-// `universe init` when no hooks file exists yet. The hook calls our
-// hidden `universe hook-check` command before Read/Grep/Search-style
-// tools so the agent gets a nudge toward universe_context when the
-// graph already knows the symbol.
-const cursorHooksBody = `{
+// universeHookCommand returns the command string for .cursor/hooks.json.
+// We resolve the absolute path to the currently-running universe binary
+// (the one the user just invoked `universe init` with) and bake it into
+// the hook command. Doing this avoids two bugs we've seen in practice:
+//
+//   1. Cursor launches hook commands with a clean PATH that doesn't
+//      always include the npm global bin directory on Windows — the
+//      hook just silently failed to fire.
+//   2. Different machines have universe at different paths (npm global
+//      vs. a local go build vs. an absolute install). Hardcoding any
+//      one of those breaks the others.
+//
+// Resolving the path at init time pins it to whatever was on the
+// developer's PATH when they ran `universe init`, which is the version
+// they want their agent to use anyway.
+//
+// JSON requires backslashes to be escaped — strconv.Quote handles both
+// that and any spaces in the path in one go.
+func universeHookCommand() string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		// Fall back to bare name — works wherever PATH is set, which is
+		// most CI environments and most Mac/Linux dev boxes.
+		exe = "universe"
+	}
+	// Wrap in quotes so paths containing spaces don't tokenize wrong
+	// when Cursor forks the command.
+	quoted := strconv.Quote(exe)
+	return quoted + " hook-check \"$TOOL_NAME\" \"$TOOL_INPUT\""
+}
+
+// renderHooksBody returns the .cursor/hooks.json contents with the
+// command line baked to the absolute path of the universe binary.
+func renderHooksBody() string {
+	cmd := universeHookCommand()
+	// Embed `cmd` (already a JSON string literal from strconv.Quote)
+	// directly into the JSON document — using fmt.Sprintf instead of
+	// templating to keep dependencies minimal.
+	return `{
   "hooks": {
     "PreToolUse": [
       {
@@ -80,7 +114,7 @@ const cursorHooksBody = `{
         },
         "hook": {
           "type": "command",
-          "command": "universe hook-check \"$TOOL_NAME\" \"$TOOL_INPUT\"",
+          "command": ` + jsonString(cmd) + `,
           "timeout_ms": 500,
           "on_failure": "ignore"
         }
@@ -89,6 +123,14 @@ const cursorHooksBody = `{
   }
 }
 `
+}
+
+// jsonString returns `s` as a JSON-safe quoted string. Wrapper around
+// strconv.Quote with a tiny rename so the embedded JSON above reads
+// naturally.
+func jsonString(s string) string {
+	return strconv.Quote(s)
+}
 
 // writeCursorHooks writes .cursor/hooks.json if and only if the file
 // doesn't already exist. We never overwrite — a user might have hand-
@@ -102,7 +144,7 @@ func writeCursorHooks(projectDir string) (bool, string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return false, path, err
 	}
-	if err := os.WriteFile(path, []byte(cursorHooksBody), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(renderHooksBody()), 0o644); err != nil {
 		return false, path, err
 	}
 	return true, path, nil
