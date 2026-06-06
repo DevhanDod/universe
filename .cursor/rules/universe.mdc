@@ -6,32 +6,35 @@ alwaysApply: true
 # Universe Knowledge Graph
 
 A prebuilt knowledge graph of this codebase is available. Query it
-via the terminal BEFORE grepping or reading source files.
+via the Shell tool BEFORE grepping or reading source files.
 
-## When to use
+## How to invoke
 
-For any question about code structure, definitions, callers, callees,
-dependencies, or impact — run the query first:
+Run the per-project wrapper from the project root:
 
-  universe query <SymbolName>
+  .universe/run.cmd query <SymbolName>
+
+The wrapper resolves the universe binary's absolute path so it works
+regardless of Cursor's PATH. If the file is missing, re-run
+`universe init` to regenerate it.
 
 This returns definition location, type, cluster, callers, callees,
-execution flows, and impact in ~200 tokens. Faster and cheaper than
-grepping the codebase and reading multiple files.
+flows, and impact in ~200 tokens. Faster and cheaper than grepping
+the codebase and reading multiple files.
 
 ## Commands
 
-  universe query <name>     definition + callers + callees + flows
-  universe search <term>    find symbols by name / path / package
-  universe impact <name>    what breaks if you change this
-  universe deps <name>      dependency list
+  .universe/run.cmd query <name>     definition + callers + callees + flows
+  .universe/run.cmd search <term>    find symbols by name / path / package
+  .universe/run.cmd impact <name>    what breaks if you change this
+  .universe/run.cmd deps <name>      dependency list
 
 ## When NOT to use
 
 - Creating or editing files (just edit them directly).
 - Running tests, builds, or deployments.
 - Questions unrelated to code structure.
-- If `universe query` returns "not found", fall back to Grep + Read.
+- If `query` returns "not found", fall back to Grep + Read.
 
 ## Important
 
@@ -41,3 +44,5 @@ grepping the codebase and reading multiple files.
 - If you need the actual source code of a function (not just its
   relationships), read ONLY the specific lines the graph shows
   (e.g. file.go:36-50), not the entire file.
+- Do NOT read .universe/graph.json directly — it is large and the
+  query command extracts what you need.

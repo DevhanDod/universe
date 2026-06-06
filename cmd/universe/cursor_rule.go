@@ -6,6 +6,16 @@ import (
 	"strconv"
 )
 
+// universeSessionDigestCommand returns the command Cursor invokes at
+// sessionStart. We route through the per-project wrapper at
+// .universe/run.cmd|run.sh so hooks.json stays portable across
+// machines — the wrapper holds the absolute binary path, the hook
+// holds only a relative reference. Matches the same indirection the
+// generated rule uses.
+func universeSessionDigestCommand() string {
+	return universeRunWrapperRelPath() + " session-digest"
+}
+
 // renderCursorRuleBody builds the .cursor/rules/universe.mdc contents.
 //
 // The rule references a per-project wrapper script at .universe/run.cmd
@@ -126,18 +136,6 @@ func renderHooksBody() string {
   }
 }
 `
-}
-
-// universeSessionDigestCommand returns the command Cursor invokes at
-// session start. We resolve the absolute path of the running binary so
-// Cursor's clean PATH (which often omits the npm global bin on Windows)
-// doesn't matter.
-func universeSessionDigestCommand() string {
-	exe, err := os.Executable()
-	if err != nil || exe == "" {
-		exe = "universe"
-	}
-	return strconv.Quote(exe) + " session-digest"
 }
 
 // jsonString returns `s` as a JSON-safe quoted string. Wrapper around

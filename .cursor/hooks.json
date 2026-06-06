@@ -3,7 +3,7 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": "\"C:\\\\Users\\\\dedolk\\\\AppData\\\\Local\\\\Temp\\\\go-build2666326600\\\\b001\\\\exe\\\\universe.exe\" session-digest",
+        "command": ".universe/run.cmd session-digest",
         "timeout": 5
       }
     ]
