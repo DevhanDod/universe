@@ -1,55 +1,43 @@
 ---
-description: "Universe knowledge graph — hook-delivered, no MCP tools"
+description: "Universe knowledge graph — query-first code intelligence"
 alwaysApply: true
 ---
 
-# Universe — Hook-Delivered Code Intelligence
+# Universe Knowledge Graph
 
-Universe gives you a precomputed knowledge graph of this codebase
-(callers, callees, flows, clusters, impact, confidence) automatically
-through Cursor's PreToolUse hook. There is no tool to call.
+A prebuilt knowledge graph of this codebase is available. Query it
+via the terminal BEFORE grepping or reading source files.
 
-## How it works
+## When to use
 
-When you Read / Grep / Search a symbol, the hook checks the graph
-BEFORE the tool runs and prints the answer into your context. You will
-see a block like:
+For any question about code structure, definitions, callers, callees,
+dependencies, or impact — run the query first:
 
-  [Universe] ErrorResponse [struct] test-server.go:58 (test_server)
-  Callers (1): sendError [method] test-server.go:563
-  Flows: handleRequest
-  Impact: low — 1 affected node(s)
-  Confidence: all relationships ≥90%
-  Graph has complete context. File read is likely unnecessary.
+  universe query <SymbolName>
 
-## What to do with hook output
+This returns definition location, type, cluster, callers, callees,
+execution flows, and impact in ~200 tokens. Faster and cheaper than
+grepping the codebase and reading multiple files.
 
-- "File read is likely unnecessary" (confidence ≥80%) — SKIP the file
-  read entirely. The graph answered the question.
-- "Targeted file read may help verify" (confidence 50–80%) — Read ONLY
-  the line range the hook showed (e.g. test-server.go:58–66), not the
-  whole file.
-- No hook output — graph has no data for this symbol; proceed normally.
+## Commands
 
-## Shell commands (optional, on demand)
+  universe query <name>     definition + callers + callees + flows
+  universe search <term>    find symbols by name / path / package
+  universe impact <name>    what breaks if you change this
+  universe deps <name>      dependency list
 
-- universe query <name>    same data as the hook, on demand
-- universe impact <name>   blast radius (--max-depth, --min-confidence)
-- universe search <term>   find symbols by name / path / package
-- universe deps <name>     direct callers + callees
-- universe recall <query>  past observations from memory
+## When NOT to use
 
-## Write commands (shell, structured input)
+- Creating or editing files (just edit them directly).
+- Running tests, builds, or deployments.
+- Questions unrelated to code structure.
+- If `universe query` returns "not found", fall back to Grep + Read.
 
-- universe store-observation --category <fix|pattern|decision> --summary "..." [--node ID]
-- universe report-skill --skill-id <id> --success|--failure
-- universe store-plan --title "..." --step "1. ..." --step "2. ..."
-- universe store-plan-result --plan-id <id> --success [--summary ...]
-- universe verify-plan --plan-id <id> --approve|--reject [--note ...]
+## Important
 
-## DO NOT
-
-- Do NOT read .universe/graph.json directly. It is large and structural;
-  the hook gives you what you need.
-- Do NOT read entire files when the hook gave you a line range.
-- Do NOT call a Universe MCP tool — there is no MCP server anymore.
+- Trust definition, location, type, and callees from the graph.
+- Caller counts may be incomplete (graph coverage varies by project).
+  If you need an exact caller list, verify with Grep.
+- If you need the actual source code of a function (not just its
+  relationships), read ONLY the specific lines the graph shows
+  (e.g. file.go:36-50), not the entire file.

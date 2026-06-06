@@ -1,16 +1,10 @@
 {
+  "version": 1,
   "hooks": {
-    "PreToolUse": [
+    "sessionStart": [
       {
-        "matcher": {
-          "tool_names": ["Read", "ReadFile", "Grep", "Search", "RipGrep", "Glob", "ListFiles"]
-        },
-        "hook": {
-          "type": "command",
-          "command": "universe hook-check \"$TOOL_NAME\" \"$TOOL_INPUT\"",
-          "timeout_ms": 500,
-          "on_failure": "ignore"
-        }
+        "command": "\"C:\\\\Users\\\\dedolk\\\\AppData\\\\Local\\\\Temp\\\\go-build2666326600\\\\b001\\\\exe\\\\universe.exe\" session-digest",
+        "timeout": 5
       }
     ]
   }

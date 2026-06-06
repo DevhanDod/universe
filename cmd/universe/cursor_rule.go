@@ -6,130 +6,94 @@ import (
 	"strconv"
 )
 
-// cursorRuleBody is the steering rule we drop into the user's project so
-// Cursor (and any other MCP-aware agent that reads .cursor/rules) prefers
-// our compact MCP tools over slurping .universe/graph.json raw. The latter
-// was happening in practice and was the dominant cause of token blow-ups.
+// cursorRuleBody is intentionally under ~400 tokens — every byte here
+// is paid on every turn of every chat. The shape (Graphify model) is
+// rule + shell CLI: tell the agent to run `universe query <name>` via
+// Cursor's built-in Shell tool before grepping, and trust the output.
+// Shell tool results land in the agent's context the same way any
+// other tool result does, which is the one path Cursor reliably honors.
 const cursorRuleBody = `---
-description: "Universe knowledge graph — hook-delivered, no MCP tools"
+description: "Universe knowledge graph — query-first code intelligence"
 alwaysApply: true
 ---
 
-# Universe — Hook-Delivered Code Intelligence
+# Universe Knowledge Graph
 
-Universe gives you a precomputed knowledge graph of this codebase
-(callers, callees, flows, clusters, impact, confidence) automatically
-through Cursor's PreToolUse hook. There is no tool to call.
+A prebuilt knowledge graph of this codebase is available. Query it
+via the terminal BEFORE grepping or reading source files.
 
-## How it works
+## When to use
 
-When you Read / Grep / Search a symbol, the hook checks the graph
-BEFORE the tool runs and prints the answer into your context. You will
-see a block like:
+For any question about code structure, definitions, callers, callees,
+dependencies, or impact — run the query first:
 
-  [Universe] ErrorResponse [struct] test-server.go:58 (test_server)
-  Callers (1): sendError [method] test-server.go:563
-  Flows: handleRequest
-  Impact: low — 1 affected node(s)
-  Confidence: all relationships ≥90%
-  Graph has complete context. File read is likely unnecessary.
+  universe query <SymbolName>
 
-## What to do with hook output
+This returns definition location, type, cluster, callers, callees,
+execution flows, and impact in ~200 tokens. Faster and cheaper than
+grepping the codebase and reading multiple files.
 
-- "File read is likely unnecessary" (confidence ≥80%) — SKIP the file
-  read entirely. The graph answered the question.
-- "Targeted file read may help verify" (confidence 50–80%) — Read ONLY
-  the line range the hook showed (e.g. test-server.go:58–66), not the
-  whole file.
-- No hook output — graph has no data for this symbol; proceed normally.
+## Commands
 
-## Shell commands (optional, on demand)
+  universe query <name>     definition + callers + callees + flows
+  universe search <term>    find symbols by name / path / package
+  universe impact <name>    what breaks if you change this
+  universe deps <name>      dependency list
 
-- universe query <name>    same data as the hook, on demand
-- universe impact <name>   blast radius (--max-depth, --min-confidence)
-- universe search <term>   find symbols by name / path / package
-- universe deps <name>     direct callers + callees
-- universe recall <query>  past observations from memory
+## When NOT to use
 
-## Write commands (shell, structured input)
+- Creating or editing files (just edit them directly).
+- Running tests, builds, or deployments.
+- Questions unrelated to code structure.
+- If ` + "`universe query`" + ` returns "not found", fall back to Grep + Read.
 
-- universe store-observation --category <fix|pattern|decision> --summary "..." [--node ID]
-- universe report-skill --skill-id <id> --success|--failure
-- universe store-plan --title "..." --step "1. ..." --step "2. ..."
-- universe store-plan-result --plan-id <id> --success [--summary ...]
-- universe verify-plan --plan-id <id> --approve|--reject [--note ...]
+## Important
 
-## DO NOT
-
-- Do NOT read .universe/graph.json directly. It is large and structural;
-  the hook gives you what you need.
-- Do NOT read entire files when the hook gave you a line range.
-- Do NOT call a Universe MCP tool — there is no MCP server anymore.
+- Trust definition, location, type, and callees from the graph.
+- Caller counts may be incomplete (graph coverage varies by project).
+  If you need an exact caller list, verify with Grep.
+- If you need the actual source code of a function (not just its
+  relationships), read ONLY the specific lines the graph shows
+  (e.g. file.go:36-50), not the entire file.
 `
 
-// universeHookCommand returns the command string for .cursor/hooks.json.
-// We resolve the absolute path to the currently-running universe binary
-// (the one the user just invoked `universe init` with) and bake it into
-// the hook command. Doing this avoids two bugs we've seen in practice:
+// renderHooksBody returns the .cursor/hooks.json contents.
 //
-//   1. Cursor launches hook commands with a clean PATH that doesn't
-//      always include the npm global bin directory on Windows — the
-//      hook just silently failed to fire.
-//   2. Different machines have universe at different paths (npm global
-//      vs. a local go build vs. an absolute install). Hardcoding any
-//      one of those breaks the others.
+// v0.4.0 drops preToolUse / postToolUse entirely. Both were tried (v0.3.x)
+// and confirmed to be non-functional in Cursor — Cursor doesn't inject
+// hook stdout into the agent context for those events. The one hook
+// channel that does deliver is sessionStart, where the JSON response's
+// `additional_context` field IS injected into the model context for the
+// whole session. We use it to drop a small project digest.
 //
-// Resolving the path at init time pins it to whatever was on the
-// developer's PATH when they ran `universe init`, which is the version
-// they want their agent to use anyway.
-//
-// JSON requires backslashes to be escaped — strconv.Quote handles both
-// that and any spaces in the path in one go.
-func universeHookCommand() string {
-	exe, err := os.Executable()
-	if err != nil || exe == "" {
-		// Fall back to bare name — works wherever PATH is set, which is
-		// most CI environments and most Mac/Linux dev boxes.
-		exe = "universe"
-	}
-	// Wrap in quotes so paths containing spaces don't tokenize wrong
-	// when Cursor forks the command.
-	quoted := strconv.Quote(exe)
-	return quoted + " hook-check \"$TOOL_NAME\" \"$TOOL_INPUT\""
-}
-
-// renderHooksBody returns the .cursor/hooks.json contents in Cursor's
-// documented schema: https://cursor.com/docs/hooks.md
-//
-//   { "version": 1,
-//     "hooks": {
-//       "preToolUse": [
-//         { "command": "./binary args", "matcher": "Read|Grep|..." }
-//       ]
-//     } }
-//
-// Versions before v0.3.3 shipped a schema invented from Claude Code's
-// hook docs (PascalCase event key, matcher-as-object, command nested
-// under "hook"); Cursor silently rejected the whole file. That is the
-// reason the hook never fired in chat despite the binary working
-// perfectly when invoked by hand.
+// Schema matches https://cursor.com/docs/hooks.md: top-level "version": 1,
+// camelCase event keys, command as a string, timeout in seconds.
 func renderHooksBody() string {
-	cmd := universeHookCommand()
-	// Matcher is a regex Cursor evaluates against the tool name; we
-	// list every Read/Grep-style tool we want to intercept.
-	matcher := "Read|ReadFile|Grep|Search|RipGrep|Glob|ListFiles"
+	cmd := universeSessionDigestCommand()
 	return `{
   "version": 1,
   "hooks": {
-    "preToolUse": [
+    "sessionStart": [
       {
         "command": ` + jsonString(cmd) + `,
-        "matcher": ` + jsonString(matcher) + `
+        "timeout": 5
       }
     ]
   }
 }
 `
+}
+
+// universeSessionDigestCommand returns the command Cursor invokes at
+// session start. We resolve the absolute path of the running binary so
+// Cursor's clean PATH (which often omits the npm global bin on Windows)
+// doesn't matter.
+func universeSessionDigestCommand() string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		exe = "universe"
+	}
+	return strconv.Quote(exe) + " session-digest"
 }
 
 // jsonString returns `s` as a JSON-safe quoted string. Wrapper around
