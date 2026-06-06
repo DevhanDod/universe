@@ -3,7 +3,7 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": ".universe/run.cmd session-digest",
+        "command": "universe session-digest",
         "timeout": 5
       }
     ]

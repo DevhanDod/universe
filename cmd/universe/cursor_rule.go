@@ -13,7 +13,7 @@ import (
 // holds only a relative reference. Matches the same indirection the
 // generated rule uses.
 func universeSessionDigestCommand() string {
-	return universeRunWrapperRelPath() + " session-digest"
+	return "universe session-digest"
 }
 
 // renderCursorRuleBody builds the .cursor/rules/universe.mdc contents.
@@ -33,7 +33,6 @@ func universeSessionDigestCommand() string {
 //
 // Kept under ~500 tokens since every byte ships on every turn.
 func renderCursorRuleBody() string {
-	wrap := universeRunWrapperRelPath()
 	return `---
 description: "Universe knowledge graph — query-first code intelligence"
 alwaysApply: true
@@ -41,47 +40,26 @@ alwaysApply: true
 
 # Universe Knowledge Graph
 
-A prebuilt knowledge graph of this codebase is available. Query it
-via the Shell tool BEFORE grepping or reading source files.
+This project has a knowledge graph at .universe/ with symbol definitions,
+caller/callee relationships, execution flows, clusters, and impact analysis.
 
-## How to invoke
+Rules:
 
-Run the per-project wrapper from the project root:
-
-  ` + wrap + ` query <SymbolName>
-
-The wrapper resolves the universe binary's absolute path so it works
-regardless of Cursor's PATH. If the file is missing, re-run
-` + "`universe init`" + ` to regenerate it.
-
-This returns definition location, type, cluster, callers, callees,
-flows, and impact in ~200 tokens. Faster and cheaper than grepping
-the codebase and reading multiple files.
-
-## Commands
-
-  ` + wrap + ` query <name>     definition + callers + callees + flows
-  ` + wrap + ` search <term>    find symbols by name / path / package
-  ` + wrap + ` impact <name>    what breaks if you change this
-  ` + wrap + ` deps <name>      dependency list
-
-## When NOT to use
-
-- Creating or editing files (just edit them directly).
-- Running tests, builds, or deployments.
-- Questions unrelated to code structure.
-- If ` + "`query`" + ` returns "not found", fall back to Grep + Read.
-
-## Important
-
-- Trust definition, location, type, and callees from the graph.
-- Caller counts may be incomplete (graph coverage varies by project).
-  If you need an exact caller list, verify with Grep.
-- If you need the actual source code of a function (not just its
-  relationships), read ONLY the specific lines the graph shows
-  (e.g. file.go:36-50), not the entire file.
-- Do NOT read .universe/graph.json directly — it is large and the
-  query command extracts what you need.
+* For codebase questions, first run ` + "`universe query \"<name>\"`" + ` when
+  .universe/graph.json exists. Use ` + "`universe impact \"<name>\"`" + ` for blast
+  radius and ` + "`universe search \"<term>\"`" + ` for broad lookups. These return
+  a scoped summary, usually much smaller than grep + file read output.
+* Stale .universe/ files are expected after code changes; a stale graph
+  is not a reason to skip universe. Only skip universe if the user
+  explicitly says not to use it.
+* Read source files only when query/impact/search do not surface enough
+  context, and then read ONLY the specific lines the graph points to,
+  not entire files.
+* After modifying code, run ` + "`universe init`" + ` to keep the graph current.
+* Trust definition, location, type, and callees from the graph.
+  Caller counts may be incomplete — verify with grep if exact counts
+  are needed.
+* Do NOT read .universe/graph.json directly.
 `
 }
 
