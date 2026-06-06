@@ -6,13 +6,28 @@ import (
 	"strconv"
 )
 
-// cursorRuleBody is intentionally under ~400 tokens — every byte here
-// is paid on every turn of every chat. The shape (Graphify model) is
-// rule + shell CLI: tell the agent to run `universe query <name>` via
-// Cursor's built-in Shell tool before grepping, and trust the output.
-// Shell tool results land in the agent's context the same way any
-// other tool result does, which is the one path Cursor reliably honors.
-const cursorRuleBody = `---
+// renderCursorRuleBody builds the .cursor/rules/universe.mdc contents
+// with the absolute path of the running universe binary baked into every
+// command example.
+//
+// Why bake the path: Cursor launches Shell tool calls with a clean
+// environment, and the npm global bin directory is frequently missing
+// from that PATH on Windows. A rule that says "run `universe query`"
+// gets a "command not found" response, the agent gives up, and reaches
+// for Grep+Read instead. By writing the absolute path into the rule we
+// remove that failure mode.
+//
+// We also expose a UNIVERSE_BIN env-var convention — projects that
+// genuinely want a stable name (CI, shared dotfiles) can set it; the
+// rule still mentions the literal path so the agent doesn't have to
+// guess. Kept under ~500 tokens.
+func renderCursorRuleBody() string {
+	bin := universeBinaryPath()
+	q := bin
+	if needsQuoting(bin) {
+		q = `"` + bin + `"`
+	}
+	return `---
 description: "Universe knowledge graph — query-first code intelligence"
 alwaysApply: true
 ---
@@ -20,32 +35,35 @@ alwaysApply: true
 # Universe Knowledge Graph
 
 A prebuilt knowledge graph of this codebase is available. Query it
-via the terminal BEFORE grepping or reading source files.
+via the Shell tool BEFORE grepping or reading source files.
 
-## When to use
+## How to invoke
 
-For any question about code structure, definitions, callers, callees,
-dependencies, or impact — run the query first:
+Cursor's PATH does not always include the npm global bin directory,
+so call the universe binary by its absolute path:
 
-  universe query <SymbolName>
+  ` + q + ` query <SymbolName>
+
+(Adjust the path if your install lives elsewhere — find it with
+` + "`where universe`" + ` on Windows or ` + "`which universe`" + ` on Mac/Linux.)
 
 This returns definition location, type, cluster, callers, callees,
-execution flows, and impact in ~200 tokens. Faster and cheaper than
-grepping the codebase and reading multiple files.
+flows, and impact in ~200 tokens. Faster and cheaper than grepping
+the codebase and reading multiple files.
 
-## Commands
+## Commands (replace <bin> with the absolute path above)
 
-  universe query <name>     definition + callers + callees + flows
-  universe search <term>    find symbols by name / path / package
-  universe impact <name>    what breaks if you change this
-  universe deps <name>      dependency list
+  <bin> query <name>     definition + callers + callees + flows
+  <bin> search <term>    find symbols by name / path / package
+  <bin> impact <name>    what breaks if you change this
+  <bin> deps <name>      dependency list
 
 ## When NOT to use
 
 - Creating or editing files (just edit them directly).
 - Running tests, builds, or deployments.
 - Questions unrelated to code structure.
-- If ` + "`universe query`" + ` returns "not found", fall back to Grep + Read.
+- If ` + "`query`" + ` returns "not found", fall back to Grep + Read.
 
 ## Important
 
@@ -55,7 +73,36 @@ grepping the codebase and reading multiple files.
 - If you need the actual source code of a function (not just its
   relationships), read ONLY the specific lines the graph shows
   (e.g. file.go:36-50), not the entire file.
+- Do NOT read .universe/graph.json directly — it is large and the
+  query command extracts what you need.
 `
+}
+
+// universeBinaryPath returns the absolute path of the currently running
+// universe binary so it can be embedded in generated config files.
+// Falls back to the bare name "universe" if the OS doesn't expose it.
+func universeBinaryPath() string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		return "universe"
+	}
+	if abs, err := filepath.Abs(exe); err == nil {
+		return abs
+	}
+	return exe
+}
+
+// needsQuoting reports whether a path contains characters that the
+// shell would tokenize on. Spaces are the common case (Program Files,
+// "OneDrive - Company") but we wrap anything with a space-equivalent.
+func needsQuoting(p string) bool {
+	for _, c := range p {
+		if c == ' ' || c == '\t' {
+			return true
+		}
+	}
+	return false
+}
 
 // renderHooksBody returns the .cursor/hooks.json contents.
 //
@@ -130,10 +177,11 @@ func writeCursorRule(projectDir string) (bool, string, error) {
 		return false, "", err
 	}
 	path := filepath.Join(dir, "universe.mdc")
-	if existing, err := os.ReadFile(path); err == nil && string(existing) == cursorRuleBody {
+	body := renderCursorRuleBody()
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == body {
 		return false, path, nil
 	}
-	if err := os.WriteFile(path, []byte(cursorRuleBody), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		return false, path, err
 	}
 	return true, path, nil
