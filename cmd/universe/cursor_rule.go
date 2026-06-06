@@ -6,27 +6,24 @@ import (
 	"strconv"
 )
 
-// renderCursorRuleBody builds the .cursor/rules/universe.mdc contents
-// with the absolute path of the running universe binary baked into every
-// command example.
+// renderCursorRuleBody builds the .cursor/rules/universe.mdc contents.
 //
-// Why bake the path: Cursor launches Shell tool calls with a clean
-// environment, and the npm global bin directory is frequently missing
-// from that PATH on Windows. A rule that says "run `universe query`"
-// gets a "command not found" response, the agent gives up, and reaches
-// for Grep+Read instead. By writing the absolute path into the rule we
-// remove that failure mode.
+// The rule references a per-project wrapper script at .universe/run.cmd
+// (Windows) or .universe/run.sh (POSIX) rather than the bare `universe`
+// command or an absolute path. The wrapper is written by
+// writeUniverseRunWrapper at init time and contains the absolute path
+// to whichever universe binary ran init. This makes the rule:
 //
-// We also expose a UNIVERSE_BIN env-var convention — projects that
-// genuinely want a stable name (CI, shared dotfiles) can set it; the
-// rule still mentions the literal path so the agent doesn't have to
-// guess. Kept under ~500 tokens.
+//   - PATH-independent — Cursor's Shell tool doesn't need npm's global
+//     bin directory in its environment.
+//   - Identical across machines — the rule text is the same everywhere
+//     because the per-machine detail lives in the wrapper script.
+//   - Self-healing — re-running `universe init` rewrites the wrapper
+//     against the current binary, so reinstalls don't break the agent.
+//
+// Kept under ~500 tokens since every byte ships on every turn.
 func renderCursorRuleBody() string {
-	bin := universeBinaryPath()
-	q := bin
-	if needsQuoting(bin) {
-		q = `"` + bin + `"`
-	}
+	wrap := universeRunWrapperRelPath()
 	return `---
 description: "Universe knowledge graph — query-first code intelligence"
 alwaysApply: true
@@ -39,24 +36,24 @@ via the Shell tool BEFORE grepping or reading source files.
 
 ## How to invoke
 
-Cursor's PATH does not always include the npm global bin directory,
-so call the universe binary by its absolute path:
+Run the per-project wrapper from the project root:
 
-  ` + q + ` query <SymbolName>
+  ` + wrap + ` query <SymbolName>
 
-(Adjust the path if your install lives elsewhere — find it with
-` + "`where universe`" + ` on Windows or ` + "`which universe`" + ` on Mac/Linux.)
+The wrapper resolves the universe binary's absolute path so it works
+regardless of Cursor's PATH. If the file is missing, re-run
+` + "`universe init`" + ` to regenerate it.
 
 This returns definition location, type, cluster, callers, callees,
 flows, and impact in ~200 tokens. Faster and cheaper than grepping
 the codebase and reading multiple files.
 
-## Commands (replace <bin> with the absolute path above)
+## Commands
 
-  <bin> query <name>     definition + callers + callees + flows
-  <bin> search <term>    find symbols by name / path / package
-  <bin> impact <name>    what breaks if you change this
-  <bin> deps <name>      dependency list
+  ` + wrap + ` query <name>     definition + callers + callees + flows
+  ` + wrap + ` search <term>    find symbols by name / path / package
+  ` + wrap + ` impact <name>    what breaks if you change this
+  ` + wrap + ` deps <name>      dependency list
 
 ## When NOT to use
 

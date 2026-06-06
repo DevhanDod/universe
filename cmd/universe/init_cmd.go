@@ -80,6 +80,16 @@ func runInit(_ *cobra.Command, _ []string) error {
 		fmt.Printf("   Report: %s\n", reportPath)
 	}
 
+	// Write the per-project run wrapper FIRST so the rule we generate
+	// next references a file that actually exists. The wrapper bakes
+	// the absolute binary path; the rule references it by relative
+	// path so it stays portable across machines.
+	if wrapperPath, err := writeUniverseRunWrapper(absPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: run wrapper: %v\n", err)
+	} else {
+		fmt.Printf("   Run wrapper: %s\n", wrapperPath)
+	}
+
 	// Drop a Cursor rule that steers the agent to shell commands and the
 	// report file instead of reading .universe/graph.json raw.
 	if wrote, rulePath, err := writeCursorRule(absPath); err == nil && wrote {
